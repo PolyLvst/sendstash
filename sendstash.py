@@ -6,6 +6,9 @@ import subprocess
 import argparse
 import tempfile
 import re
+import platform
+import shutil
+import glob as globmod
 from datetime import datetime, timedelta
 
 
@@ -223,6 +226,224 @@ class SendStash:
         """Get the base remote directory from config."""
         return self.config['smb'].get('remote_dir', 'stash-sync')
 
+    def _detect_backend(self):
+        """Detect whether to use mount-based I/O or smbclient."""
+        if hasattr(self, '_backend'):
+            return self._backend, self._mount_root
+
+        smb = self.config['smb']
+
+        # 1. Explicit mount_path in config
+        mount_path = smb.get('mount_path')
+        if mount_path:
+            mount_path = os.path.expanduser(mount_path)
+            if os.path.exists(mount_path):
+                self._backend = 'mount'
+                self._mount_root = mount_path
+                return self._backend, self._mount_root
+            else:
+                print(f"Warning: Configured mount_path '{mount_path}' does not exist.")
+
+        server = smb.get('server', '')
+        # Parse //server/share into components
+        parts = server.replace('\\', '/').strip('/').split('/')
+        if len(parts) < 2:
+            self._backend = 'smbclient'
+            self._mount_root = None
+            return self._backend, self._mount_root
+
+        host, share = parts[0], parts[1]
+        system = platform.system()
+        is_wsl = False
+
+        if system == 'Linux':
+            try:
+                with open('/proc/version', 'r') as f:
+                    proc_version = f.read()
+                if 'microsoft' in proc_version.lower():
+                    is_wsl = True
+            except (OSError, IOError):
+                pass
+
+        # 2. Auto-detect existing mounts
+        if system == 'Windows':
+            unc_path = f'\\\\{host}\\{share}'
+            if os.path.exists(unc_path):
+                self._backend = 'mount'
+                self._mount_root = unc_path
+                return self._backend, self._mount_root
+        elif is_wsl:
+            mnt_path = f'/mnt/{host}/{share}'
+            if os.path.exists(mnt_path):
+                self._backend = 'mount'
+                self._mount_root = mnt_path
+                return self._backend, self._mount_root
+
+        # 3. Attempt auto-mount on Windows/WSL
+        if system == 'Windows' or is_wsl:
+            mount_result = self._ensure_mount(host, share, is_wsl)
+            self._backend = 'mount'
+            self._mount_root = mount_result
+            return self._backend, self._mount_root
+
+        # 4. Native Linux — fall back to smbclient
+        self._backend = 'smbclient'
+        self._mount_root = None
+        return self._backend, self._mount_root
+
+    def _ensure_mount(self, host, share, is_wsl):
+        """Attempt to auto-mount the SMB share on Windows/WSL. Exits on failure."""
+        smb = self.config['smb']
+        username = smb.get('username', '')
+        password = smb.get('password', '')
+
+        if is_wsl:
+            unc = f'\\\\\\\\{host}\\\\{share}'
+            cmd = [
+                'powershell.exe', '-Command',
+                f'net use {unc} /user:{username} {password}'
+            ]
+            mount_path = f'/mnt/{host}/{share}'
+        else:
+            # Native Windows
+            unc = f'\\\\{host}\\{share}'
+            cmd = ['net', 'use', unc, f'/user:{username}', password]
+            mount_path = unc
+
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode == 0 and os.path.exists(mount_path):
+                print(f"Auto-mounted SMB share at: {mount_path}")
+                return mount_path
+        except (OSError, FileNotFoundError):
+            pass
+
+        print("Error: Could not auto-mount the SMB share.")
+        if is_wsl:
+            print(f"  Try manually: powershell.exe -Command \"net use \\\\\\\\{host}\\\\{share} /user:{username} <password>\"")
+            print(f"  Or: sudo mount -t cifs //{host}/{share} /mnt/{host}/{share} -o username={username},password=<password>")
+        else:
+            print(f"  Try manually: net use \\\\{host}\\{share} /user:{username} <password>")
+        print("  Or set 'mount_path' in your config.yaml to the mount point.")
+        sys.exit(1)
+
+    def _get_share_path(self, *parts):
+        """Return the full local path to a file/dir on the mounted share."""
+        return os.path.join(self._mount_root, self._get_remote_dir(), *parts)
+
+    def _list_patches_raw(self, repo_name):
+        """List patches on the share. Returns [(name, size, date), ...] sorted by name."""
+        backend, _ = self._detect_backend()
+
+        if backend == 'mount':
+            share_dir = self._get_share_path(repo_name)
+            if not os.path.isdir(share_dir):
+                return []
+            patch_files = globmod.glob(os.path.join(share_dir, '*.patch'))
+            patches = []
+            for path in patch_files:
+                name = os.path.basename(path)
+                stat = os.stat(path)
+                size = str(stat.st_size)
+                date = datetime.fromtimestamp(stat.st_mtime).strftime('%a %b %d %H:%M:%S %Y')
+                patches.append((name, size, date))
+            patches.sort(key=lambda x: x[0])
+            return patches
+        else:
+            remote_dir = self._get_remote_dir()
+            smb_subcmd = f"ls {remote_dir}\\{repo_name}\\*.patch"
+            result = self._smb_cmd(smb_subcmd)
+            if result.returncode != 0:
+                return []
+            return self._parse_ls_output(result.stdout)
+
+    def _upload_patch(self, repo_name, local_patch, local_msg, filename, msg_filename):
+        """Upload a patch and its message file to the share."""
+        backend, _ = self._detect_backend()
+
+        if backend == 'mount':
+            dest_dir = self._get_share_path(repo_name)
+            os.makedirs(dest_dir, exist_ok=True)
+            shutil.copy2(local_patch, os.path.join(dest_dir, filename))
+            shutil.copy2(local_msg, os.path.join(dest_dir, msg_filename))
+        else:
+            remote_dir = self._get_remote_dir()
+            smb_subcmd = (
+                f"mkdir {remote_dir}; "
+                f"mkdir {remote_dir}\\{repo_name}; "
+                f"cd {remote_dir}\\{repo_name}; "
+                f"put {local_patch} {filename}; "
+                f"put {local_msg} {msg_filename}"
+            )
+            result = self._smb_cmd(smb_subcmd)
+
+            stderr_lines = result.stderr.strip().split('\n') if result.stderr else []
+            real_errors = [
+                line for line in stderr_lines
+                if line.strip() and 'NT_STATUS_OBJECT_NAME_COLLISION' not in line
+            ]
+
+            if result.returncode != 0 and real_errors:
+                print("Error uploading patch to SMB share:")
+                print('\n'.join(real_errors))
+                sys.exit(1)
+
+    def _download_patch(self, repo_name, patch_name, dest_path):
+        """Download a single patch file from the share."""
+        backend, _ = self._detect_backend()
+
+        if backend == 'mount':
+            src = self._get_share_path(repo_name, patch_name)
+            shutil.copy2(src, dest_path)
+        else:
+            remote_dir = self._get_remote_dir()
+            smb_subcmd = (
+                f"cd {remote_dir}\\{repo_name}; "
+                f"get {patch_name} {dest_path}"
+            )
+            result = self._smb_cmd(smb_subcmd)
+            if result.returncode != 0:
+                print("Error downloading patch:")
+                print(result.stderr)
+                raise RuntimeError("Download failed")
+
+    def _delete_patches(self, repo_name, patch_names):
+        """Delete patch and message files from the share."""
+        backend, _ = self._detect_backend()
+
+        if backend == 'mount':
+            for name in patch_names:
+                patch_path = self._get_share_path(repo_name, name)
+                if os.path.exists(patch_path):
+                    os.remove(patch_path)
+                msg_name = name.rsplit('.patch', 1)[0] + '.msg'
+                msg_path = self._get_share_path(repo_name, msg_name)
+                if os.path.exists(msg_path):
+                    os.remove(msg_path)
+        else:
+            remote_dir = self._get_remote_dir()
+            delete_cmds = []
+            for name in patch_names:
+                delete_cmds.append(f"del {name}")
+                msg_name = name.rsplit('.patch', 1)[0] + '.msg'
+                delete_cmds.append(f"del {msg_name}")
+
+            smb_subcmd = f"cd {remote_dir}\\{repo_name}; {'; '.join(delete_cmds)}"
+            result = self._smb_cmd(smb_subcmd)
+
+            stderr_lines = result.stderr.strip().split('\n') if result.stderr else []
+            real_errors = [
+                line for line in stderr_lines
+                if line.strip()
+                and 'NT_STATUS_OBJECT_NAME_NOT_FOUND' not in line
+                and 'NT_STATUS_NO_SUCH_FILE' not in line
+            ]
+
+            if result.returncode != 0 and real_errors:
+                print("Error cleaning patches:")
+                print('\n'.join(real_errors))
+                raise RuntimeError("Delete failed")
+
     def _get_stash_message(self, stash_ref):
         """Get the message for a stash ref from git stash list."""
         result = self._run_command('git stash list', cwd=self._get_cwd(), capture=True)
@@ -251,12 +472,7 @@ class SendStash:
     def _get_remote_hashes(self):
         """Get the set of stash hashes already present on the SMB share."""
         repo_name = self._get_repo_name()
-        remote_dir = self._get_remote_dir()
-        smb_subcmd = f"ls {remote_dir}\\{repo_name}\\*.patch"
-        result = self._smb_cmd(smb_subcmd)
-        if result.returncode != 0:
-            return set()
-        patches = self._parse_ls_output(result.stdout)
+        patches = self._list_patches_raw(repo_name)
         hashes = set()
         for name, _, _ in patches:
             # Extract 8-char hex hash from filename: branch_name_HASH_timestamp.patch
@@ -349,30 +565,7 @@ class SendStash:
             temp_msg_path = f.name
 
         try:
-            # Upload to SMB share
-            # mkdir the remote_dir and repo subdir (ignore "already exists" errors)
-            # then upload the patch and message
-            smb_subcmd = (
-                f"mkdir {remote_dir}; "
-                f"mkdir {remote_dir}\\{repo_name}; "
-                f"cd {remote_dir}\\{repo_name}; "
-                f"put {temp_patch_path} {filename}; "
-                f"put {temp_msg_path} {msg_filename}"
-            )
-            result = self._smb_cmd(smb_subcmd)
-
-            # Filter out "already exists" errors — those are expected from mkdir
-            stderr_lines = result.stderr.strip().split('\n') if result.stderr else []
-            real_errors = [
-                line for line in stderr_lines
-                if line.strip() and 'NT_STATUS_OBJECT_NAME_COLLISION' not in line
-            ]
-
-            if result.returncode != 0 and real_errors:
-                print("Error uploading patch to SMB share:")
-                print('\n'.join(real_errors))
-                sys.exit(1)
-
+            self._upload_patch(repo_name, temp_patch_path, temp_msg_path, filename, msg_filename)
             print(f"Pushed stash patch to: {remote_dir}/{repo_name}/{filename}")
             if message:
                 print(f"Message: {message}")
@@ -382,46 +575,41 @@ class SendStash:
 
     def _fetch_messages(self, repo_name, patches):
         """Batch-download .msg files for a list of patches. Returns dict of patch_name -> message."""
-        remote_dir = self._get_remote_dir()
+        backend, _ = self._detect_backend()
         messages = {}
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            smb_subcmd = (
-                f"cd {remote_dir}\\{repo_name}; "
-                f"prompt OFF; "
-                f"lcd {tmpdir}; "
-                f"mget *.msg"
-            )
-            self._smb_cmd(smb_subcmd)
-
-            # Read downloaded .msg files and match to patches by base name
+        if backend == 'mount':
             for name, _, _ in patches:
                 base = name.rsplit('.patch', 1)[0]
-                msg_path = os.path.join(tmpdir, f"{base}.msg")
+                msg_path = self._get_share_path(repo_name, f"{base}.msg")
                 if os.path.exists(msg_path):
                     with open(msg_path, 'r') as f:
                         messages[name] = f.read().strip()
+        else:
+            remote_dir = self._get_remote_dir()
+            with tempfile.TemporaryDirectory() as tmpdir:
+                smb_subcmd = (
+                    f"cd {remote_dir}\\{repo_name}; "
+                    f"prompt OFF; "
+                    f"lcd {tmpdir}; "
+                    f"mget *.msg"
+                )
+                self._smb_cmd(smb_subcmd)
+
+                for name, _, _ in patches:
+                    base = name.rsplit('.patch', 1)[0]
+                    msg_path = os.path.join(tmpdir, f"{base}.msg")
+                    if os.path.exists(msg_path):
+                        with open(msg_path, 'r') as f:
+                            messages[name] = f.read().strip()
 
         return messages
 
     def list_patches(self):
         """List available patches on the SMB share for the current repo."""
         repo_name = self._get_repo_name()
-        remote_dir = self._get_remote_dir()
 
-        smb_subcmd = f"ls {remote_dir}\\{repo_name}\\*.patch"
-        result = self._smb_cmd(smb_subcmd)
-
-        if result.returncode != 0:
-            if 'NO_SUCH_FILE' in (result.stderr or '') or 'NT_STATUS_OBJECT_NAME_NOT_FOUND' in (result.stderr or ''):
-                print(f"No patches found for repo '{repo_name}'.")
-                return []
-            print("Error listing patches:")
-            print(result.stderr)
-            return []
-
-        # Parse smbclient ls output
-        patches = self._parse_ls_output(result.stdout)
+        patches = self._list_patches_raw(repo_name)
 
         if not patches:
             print(f"No patches found for repo '{repo_name}'.")
@@ -466,17 +654,8 @@ class SendStash:
     def pull(self, latest=True, pick=False, number=None, name=None):
         """Pull a stash patch from the SMB share and apply it."""
         repo_name = self._get_repo_name()
-        remote_dir = self._get_remote_dir()
 
-        # List available patches
-        smb_subcmd = f"ls {remote_dir}\\{repo_name}\\*.patch"
-        result = self._smb_cmd(smb_subcmd)
-
-        if result.returncode != 0:
-            print(f"No patches found for repo '{repo_name}'.")
-            return
-
-        patches = self._parse_ls_output(result.stdout)
+        patches = self._list_patches_raw(repo_name)
         if not patches:
             print(f"No patches found for repo '{repo_name}'.")
             return
@@ -541,15 +720,9 @@ class SendStash:
             temp_path = f.name
 
         try:
-            smb_subcmd = (
-                f"cd {remote_dir}\\{repo_name}; "
-                f"get {patch_name} {temp_path}"
-            )
-            result = self._smb_cmd(smb_subcmd)
-
-            if result.returncode != 0:
-                print("Error downloading patch:")
-                print(result.stderr)
+            try:
+                self._download_patch(repo_name, patch_name, temp_path)
+            except RuntimeError:
                 return
 
             # Apply the patch
@@ -568,17 +741,8 @@ class SendStash:
     def clean(self, all_patches=False, older_than=None, pick=False):
         """Remove old patches from the SMB share for the current repo."""
         repo_name = self._get_repo_name()
-        remote_dir = self._get_remote_dir()
 
-        # List existing patches
-        smb_subcmd = f"ls {remote_dir}\\{repo_name}\\*.patch"
-        result = self._smb_cmd(smb_subcmd)
-
-        if result.returncode != 0:
-            print(f"No patches found for repo '{repo_name}'.")
-            return
-
-        patches = self._parse_ls_output(result.stdout)
+        patches = self._list_patches_raw(repo_name)
         if not patches:
             print(f"No patches found for repo '{repo_name}'.")
             return
@@ -626,28 +790,9 @@ class SendStash:
             print("No patches to clean.")
             return
 
-        # Build delete commands for both .patch and .msg files
-        delete_cmds = []
-        for name in to_delete:
-            delete_cmds.append(f"del {name}")
-            msg_name = name.rsplit('.patch', 1)[0] + '.msg'
-            delete_cmds.append(f"del {msg_name}")
-
-        smb_subcmd = f"cd {remote_dir}\\{repo_name}; {'; '.join(delete_cmds)}"
-        result = self._smb_cmd(smb_subcmd)
-
-        # Filter out "not found" errors for .msg files that may not exist
-        stderr_lines = result.stderr.strip().split('\n') if result.stderr else []
-        real_errors = [
-            line for line in stderr_lines
-            if line.strip()
-            and 'NT_STATUS_OBJECT_NAME_NOT_FOUND' not in line
-            and 'NT_STATUS_NO_SUCH_FILE' not in line
-        ]
-
-        if result.returncode != 0 and real_errors:
-            print("Error cleaning patches:")
-            print('\n'.join(real_errors))
+        try:
+            self._delete_patches(repo_name, to_delete)
+        except RuntimeError:
             return
 
         print(f"Cleaned {len(to_delete)} patch(es) from '{repo_name}':")

@@ -5,6 +5,8 @@ smb:
   password: "password"        # or use password_cmd
   # password_cmd: "pass show smb/stash-sync"  # alternative: command that outputs password
   remote_dir: "stash-sync"    # base directory on the share for patches
+  # mount_path: "Z:"           # Optional: explicit mount point (Windows drive letter)
+  # mount_path: "/mnt/share"   # Optional: explicit mount point for Linux/WSL
 
 # Optional: sync config from a git repo or other source
 # Use 'git pull' if your config is in a git repository
