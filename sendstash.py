@@ -873,6 +873,47 @@ class SendStash:
             if os.path.exists(temp_path):
                 os.unlink(temp_path)
 
+    def pull_all(self):
+        """Pull all patches from the SMB share and inject each as a stash entry."""
+        repo_name = self._get_repo_name()
+
+        patches = self._list_patches_raw(repo_name)
+        if not patches:
+            print(f"No patches found for repo '{repo_name}'.")
+            return
+
+        messages = self._fetch_messages(repo_name, patches)
+
+        success_count = 0
+        total = len(patches)
+
+        for patch_name, size, date in patches:
+            print(f"\n--- Pulling {patch_name} ---")
+
+            stash_name, msg = messages.get(patch_name, ('', ''))
+            stash_label = stash_name or msg or ''
+
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.patch', delete=False) as f:
+                temp_path = f.name
+
+            try:
+                try:
+                    self._download_patch(repo_name, patch_name, temp_path)
+                except RuntimeError:
+                    print(f"Failed to download {patch_name}")
+                    continue
+
+                if self._inject_stash_from_patch(temp_path, stash_label):
+                    print(f"Restored stash: {stash_label or patch_name}")
+                    success_count += 1
+                else:
+                    print(f"Failed to inject stash from {patch_name}")
+            finally:
+                if os.path.exists(temp_path):
+                    os.unlink(temp_path)
+
+        print(f"\nPulled {success_count} of {total} patch(es) as stash entries")
+
     def clean(self, all_patches=False, older_than=None, pick=False):
         """Remove old patches from the SMB share for the current repo."""
         repo_name = self._get_repo_name()
@@ -985,6 +1026,7 @@ def main():
     pull_group.add_argument('--pick', action='store_true', help="Interactively choose which patch to apply")
     pull_group.add_argument('--number', '-n', type=int, help="Pull patch by its list number")
     pull_group.add_argument('--name', help="Pull patch by name substring match")
+    pull_group.add_argument('--all', action='store_true', help="Pull all patches as stash entries")
     pull_parser.add_argument('--apply', action='store_true',
         help="Apply patch to working directory instead of restoring as stash entry")
 
@@ -1013,7 +1055,10 @@ def main():
         else:
             stash.push(message=args.message, stash_ref=args.stash)
     elif args.command == 'pull':
-        stash.pull(latest=not args.pick, pick=args.pick, number=args.number, name=args.name, apply_to_workdir=args.apply)
+        if args.all:
+            stash.pull_all()
+        else:
+            stash.pull(latest=not args.pick, pick=args.pick, number=args.number, name=args.name, apply_to_workdir=args.apply)
     elif args.command == 'list':
         stash.list_patches()
     elif args.command == 'clean':
