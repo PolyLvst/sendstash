@@ -560,6 +560,16 @@ class SendStash:
 
         return True
 
+    def _get_local_stash_hashes(self):
+        """Get the set of stash hashes for all local stash entries."""
+        entries = self._list_stash_refs()
+        hashes = set()
+        for ref, _ in entries:
+            h = self._get_stash_hash(ref)
+            if h:
+                hashes.add(h)
+        return hashes
+
     def _get_remote_hashes(self):
         """Get the set of stash hashes already present on the SMB share."""
         repo_name = self._get_repo_name()
@@ -585,7 +595,7 @@ class SendStash:
             entries.append((ref, message))
         return entries
 
-    def push_all(self, message=None):
+    def push_all(self, message=None, force=False):
         """Push all stash entries to the SMB share."""
         entries = self._list_stash_refs()
         if not entries:
@@ -593,7 +603,7 @@ class SendStash:
             return
 
         # Get existing patches on SMB to avoid duplicates
-        remote_hashes = self._get_remote_hashes()
+        remote_hashes = self._get_remote_hashes() if not force else set()
 
         for ref, _ in entries:
             stash_hash = self._get_stash_hash(ref)
@@ -601,13 +611,27 @@ class SendStash:
                 print(f"\n--- Skipping {ref} (already pushed: {stash_hash}) ---")
                 continue
             print(f"\n--- Pushing {ref} ---")
-            self.push(message=message, stash_ref=ref)
+            self.push(message=message, stash_ref=ref, force=True)
 
-    def push(self, message=None, stash_ref='stash@{0}'):
+    def push(self, message=None, stash_ref='stash@{0}', force=False):
         """Push a stash patch to the SMB share."""
+        # Normalize bare numbers like "1" into "stash@{1}"
+        if stash_ref.isdigit():
+            stash_ref = f'stash@{{{stash_ref}}}'
+
         repo_name = self._get_repo_name()
         branch = self._get_branch_name()
         remote_dir = self._get_remote_dir()
+
+        # Check for duplicate hash on remote unless --force
+        if not force:
+            stash_hash_check = self._get_stash_hash(stash_ref)
+            if stash_hash_check:
+                remote_hashes = self._get_remote_hashes()
+                if stash_hash_check in remote_hashes:
+                    print(f"Skipping: stash hash {stash_hash_check} already exists on remote.")
+                    print("Use --force to push anyway.")
+                    return
 
         # Generate the patch from stash
         result = self._run_command(f'git stash show -p "{stash_ref}"', cwd=self._get_cwd(), capture=True)
@@ -771,7 +795,7 @@ class SendStash:
         patches.sort(key=lambda x: x[0])
         return patches
 
-    def pull(self, latest=True, pick=False, number=None, name=None, apply_to_workdir=False):
+    def pull(self, latest=True, pick=False, number=None, name=None, apply_to_workdir=False, force=False):
         """Pull a stash patch from the SMB share and restore it as a stash entry (or apply directly with --apply)."""
         repo_name = self._get_repo_name()
 
@@ -836,6 +860,17 @@ class SendStash:
         patch_name = selected[0]
         selected_stash_name, selected_msg = messages.get(patch_name, ('', ''))
 
+        # Check for duplicate hash unless --force
+        if not force:
+            hash_match = re.search(r'_([0-9a-f]{8})_\d{4}-\d{2}-\d{2}_', patch_name)
+            if hash_match:
+                patch_hash = hash_match.group(1)
+                local_hashes = self._get_local_stash_hashes()
+                if patch_hash in local_hashes:
+                    print(f"Skipping: patch hash {patch_hash} already exists in local stashes.")
+                    print("Use --force to pull anyway.")
+                    return
+
         print(f"Downloading: {patch_name}")
 
         # Download patch to temp file
@@ -873,7 +908,7 @@ class SendStash:
             if os.path.exists(temp_path):
                 os.unlink(temp_path)
 
-    def pull_all(self):
+    def pull_all(self, force=False):
         """Pull all patches from the SMB share and inject each as a stash entry."""
         repo_name = self._get_repo_name()
 
@@ -884,10 +919,22 @@ class SendStash:
 
         messages = self._fetch_messages(repo_name, patches)
 
+        # Get local hashes once for duplicate detection
+        local_hashes = self._get_local_stash_hashes() if not force else set()
+
         success_count = 0
+        skipped_count = 0
         total = len(patches)
 
         for patch_name, size, date in patches:
+            # Check for duplicate hash unless --force
+            if not force:
+                hash_match = re.search(r'_([0-9a-f]{8})_\d{4}-\d{2}-\d{2}_', patch_name)
+                if hash_match and hash_match.group(1) in local_hashes:
+                    print(f"\n--- Skipping {patch_name} (hash {hash_match.group(1)} already in local stashes) ---")
+                    skipped_count += 1
+                    continue
+
             print(f"\n--- Pulling {patch_name} ---")
 
             stash_name, msg = messages.get(patch_name, ('', ''))
@@ -912,7 +959,10 @@ class SendStash:
                 if os.path.exists(temp_path):
                     os.unlink(temp_path)
 
-        print(f"\nPulled {success_count} of {total} patch(es) as stash entries")
+        summary = f"\nPulled {success_count} of {total} patch(es) as stash entries"
+        if skipped_count:
+            summary += f" ({skipped_count} skipped as duplicates)"
+        print(summary)
 
     def clean(self, all_patches=False, older_than=None, pick=False):
         """Remove old patches from the SMB share for the current repo."""
@@ -1018,6 +1068,8 @@ def main():
     push_stash_group = push_parser.add_mutually_exclusive_group()
     push_stash_group.add_argument('--stash', default='stash@{0}', help="Stash reference (default: stash@{0})")
     push_stash_group.add_argument('--stash-all', action='store_true', help="Push all stash entries")
+    push_parser.add_argument('--force', action='store_true',
+        help="Push even if the stash hash already exists on the remote")
 
     # pull
     pull_parser = subparsers.add_parser('pull', parents=[project_parser], help="Pull and apply a stash patch from the SMB share")
@@ -1029,6 +1081,8 @@ def main():
     pull_group.add_argument('--all', action='store_true', help="Pull all patches as stash entries")
     pull_parser.add_argument('--apply', action='store_true',
         help="Apply patch to working directory instead of restoring as stash entry")
+    pull_parser.add_argument('--force', action='store_true',
+        help="Pull even if the patch hash already exists in local stashes")
 
     # list
     subparsers.add_parser('list', parents=[project_parser], help="List available patches on the SMB share")
@@ -1051,14 +1105,14 @@ def main():
 
     if args.command == 'push':
         if args.stash_all:
-            stash.push_all(message=args.message)
+            stash.push_all(message=args.message, force=args.force)
         else:
-            stash.push(message=args.message, stash_ref=args.stash)
+            stash.push(message=args.message, stash_ref=args.stash, force=args.force)
     elif args.command == 'pull':
         if args.all:
-            stash.pull_all()
+            stash.pull_all(force=args.force)
         else:
-            stash.pull(latest=not args.pick, pick=args.pick, number=args.number, name=args.name, apply_to_workdir=args.apply)
+            stash.pull(latest=not args.pick, pick=args.pick, number=args.number, name=args.name, apply_to_workdir=args.apply, force=args.force)
     elif args.command == 'list':
         stash.list_patches()
     elif args.command == 'clean':
