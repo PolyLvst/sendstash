@@ -114,6 +114,32 @@ class SendStash:
             process.wait()
             return process.returncode
 
+    def sync_config(self):
+        """Syncs the configuration file itself based on 'config_sync' settings."""
+        if 'config_sync' not in self.config:
+            print("Warning: --sync-config was passed, but 'config_sync' section is not defined in config.yaml.")
+            return
+
+        sync_settings = self.config['config_sync']
+        command = sync_settings.get('command')
+
+        if not command:
+            print("Error: 'config_sync' section is missing the 'command' key.")
+            return
+
+        config_dir = os.path.dirname(self.config_path)
+
+        print(f"Syncing configuration using command: '{command}' in '{config_dir}'")
+        return_code = self._run_command(command, cwd=config_dir)
+
+        if return_code == 0:
+            print("Configuration sync completed successfully.")
+            print("Reloading configuration...")
+            self.config = self._load_config(self.config_path)
+        else:
+            print(f"Configuration sync failed with return code: {return_code}")
+            sys.exit(1)
+
     def _get_cwd(self):
         """Get the working directory — project path if set, otherwise current dir."""
         return self.project_path or None
@@ -481,15 +507,21 @@ def main():
     # Pre-parse --config so we can load projects before building the full parser
     pre_parser = argparse.ArgumentParser(add_help=False)
     pre_parser.add_argument('--config')
+    pre_parser.add_argument('--sync-config', action='store_true')
     pre_args, _ = pre_parser.parse_known_args()
 
     stash = SendStash(config_path=pre_args.config)
+
+    if pre_args.sync_config:
+        stash.sync_config()
+
     project_choices = stash.get_project_choices() or None
 
     parser = argparse.ArgumentParser(
         description="Sync git stash patches via SMB share."
     )
     parser.add_argument('--config', help="Path to config.yaml")
+    parser.add_argument('--sync-config', action='store_true', help="Sync the configuration from its source before running the command")
 
     subparsers = parser.add_subparsers(dest='command', help="Available commands")
 

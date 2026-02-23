@@ -6,6 +6,13 @@ smb:
   # password_cmd: "pass show smb/stash-sync"  # alternative: command that outputs password
   remote_dir: "stash-sync"    # base directory on the share for patches
 
+# Optional: sync config from a git repo or other source
+# Use 'git pull' if your config is in a git repository
+# config_sync:
+#   command: "git pull"
+# Or use 'rclone' to sync from a cloud storage provider
+#   command: "rclone sync your_remote:path/to/config_folder ."
+
 # Optional: define projects so you can use -p/--project from anywhere
 # root: ~/
 # projects:
