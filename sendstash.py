@@ -613,8 +613,27 @@ class SendStash:
             print(f"\n--- Pushing {ref} ---")
             self.push(message=message, stash_ref=ref, force=True)
 
-    def push(self, message=None, stash_ref='stash@{0}', force=False):
+    def push(self, message=None, stash_ref='stash@{0}', force=False, pick=False):
         """Push a stash patch to the SMB share."""
+        # Interactive pick mode
+        if pick:
+            entries = self._list_stash_refs()
+            if not entries:
+                print("No stashes found.")
+                return
+            print("Available stashes:")
+            for i, (ref, msg) in enumerate(entries, 1):
+                print(f"  {i}. {ref}: {msg}")
+            try:
+                choice = int(input("\nSelect stash number: "))
+                if choice < 1 or choice > len(entries):
+                    print("Invalid selection.")
+                    return
+                stash_ref = entries[choice - 1][0]
+            except (ValueError, EOFError):
+                print("Invalid selection.")
+                return
+
         # Normalize bare numbers like "1" into "stash@{1}"
         if stash_ref.isdigit():
             stash_ref = f'stash@{{{stash_ref}}}'
@@ -1068,6 +1087,7 @@ def main():
     push_stash_group = push_parser.add_mutually_exclusive_group()
     push_stash_group.add_argument('--stash', default='stash@{0}', help="Stash reference (default: stash@{0})")
     push_stash_group.add_argument('--stash-all', action='store_true', help="Push all stash entries")
+    push_stash_group.add_argument('--pick', action='store_true', help="Interactively choose which stash to push")
     push_parser.add_argument('--force', action='store_true',
         help="Push even if the stash hash already exists on the remote")
 
@@ -1107,7 +1127,7 @@ def main():
         if args.stash_all:
             stash.push_all(message=args.message, force=args.force)
         else:
-            stash.push(message=args.message, stash_ref=args.stash, force=args.force)
+            stash.push(message=args.message, stash_ref=args.stash, force=args.force, pick=args.pick)
     elif args.command == 'pull':
         if args.all:
             stash.pull_all(force=args.force)
