@@ -238,6 +238,33 @@ class SendStash:
                 return ''
         return ''
 
+    def _get_stash_hash(self, stash_ref):
+        """Get the short commit hash for a stash ref."""
+        result = self._run_command(
+            f'git rev-parse --short=8 "{stash_ref}"',
+            cwd=self._get_cwd(), capture=True
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return ''
+        return result.stdout.strip()
+
+    def _get_remote_hashes(self):
+        """Get the set of stash hashes already present on the SMB share."""
+        repo_name = self._get_repo_name()
+        remote_dir = self._get_remote_dir()
+        smb_subcmd = f"ls {remote_dir}\\{repo_name}\\*.patch"
+        result = self._smb_cmd(smb_subcmd)
+        if result.returncode != 0:
+            return set()
+        patches = self._parse_ls_output(result.stdout)
+        hashes = set()
+        for name, _, _ in patches:
+            # Extract 8-char hex hash from filename: branch_name_HASH_timestamp.patch
+            match = re.search(r'_([0-9a-f]{8})_\d{4}-\d{2}-\d{2}_', name)
+            if match:
+                hashes.add(match.group(1))
+        return hashes
+
     def _list_stash_refs(self):
         """Returns a list of (ref, message) for all stash entries."""
         result = self._run_command('git stash list', cwd=self._get_cwd(), capture=True)
@@ -257,7 +284,15 @@ class SendStash:
         if not entries:
             print("No stashes found.")
             return
+
+        # Get existing patches on SMB to avoid duplicates
+        remote_hashes = self._get_remote_hashes()
+
         for ref, _ in entries:
+            stash_hash = self._get_stash_hash(ref)
+            if stash_hash and stash_hash in remote_hashes:
+                print(f"\n--- Skipping {ref} (already pushed: {stash_hash}) ---")
+                continue
             print(f"\n--- Pushing {ref} ---")
             self.push(message=message, stash_ref=ref)
 
@@ -289,10 +324,15 @@ class SendStash:
         # Generate filename
         timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
         sanitized_branch = self._sanitize_name(branch)
-        # Include stash name in filename if available: branch_stashname_timestamp
+        stash_hash = self._get_stash_hash(stash_ref)
+        # Include stash name in filename if available: branch_stashname_hash_timestamp
         stash_label = self._sanitize_for_filename(stash_name) if stash_name else ''
-        if stash_label:
+        if stash_label and stash_hash:
+            base_name = f"{sanitized_branch}_{stash_label}_{stash_hash}_{timestamp}"
+        elif stash_label:
             base_name = f"{sanitized_branch}_{stash_label}_{timestamp}"
+        elif stash_hash:
+            base_name = f"{sanitized_branch}_{stash_hash}_{timestamp}"
         else:
             base_name = f"{sanitized_branch}_{timestamp}"
         filename = f"{base_name}.patch"
