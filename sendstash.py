@@ -140,6 +140,45 @@ class SendStash:
             print(f"Configuration sync failed with return code: {return_code}")
             sys.exit(1)
 
+    def open_folder(self):
+        """Opens the sendstash script directory in the file explorer."""
+        script_dir = os.path.dirname(os.path.realpath(__file__))
+
+        print(f"Opening SendStash directory: {script_dir}")
+
+        try:
+            if sys.platform == "win32":
+                subprocess.run(['explorer', script_dir], check=True)
+            elif sys.platform == "darwin":
+                subprocess.run(['open', script_dir], check=True)
+            elif sys.platform == "linux":
+                file_managers = ['xdg-open', 'nautilus', 'dolphin', 'thunar', 'nemo', 'pcmanfm']
+                opened = False
+
+                for fm in file_managers:
+                    try:
+                        subprocess.run([fm, script_dir], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        opened = True
+                        break
+                    except (subprocess.CalledProcessError, FileNotFoundError):
+                        continue
+
+                if not opened:
+                    print("Could not find a suitable file manager. Directory path:")
+                    print(f"  {script_dir}")
+                    return
+            else:
+                print(f"Unsupported platform: {sys.platform}")
+                print(f"SendStash directory: {script_dir}")
+                return
+
+        except subprocess.CalledProcessError as e:
+            print(f"Error opening folder: {e}")
+            print(f"SendStash directory: {script_dir}")
+        except Exception as e:
+            print(f"Unexpected error: {e}")
+            print(f"SendStash directory: {script_dir}")
+
     def _get_cwd(self):
         """Get the working directory — project path if set, otherwise current dir."""
         return self.project_path or None
@@ -531,9 +570,14 @@ def main():
     pre_parser = argparse.ArgumentParser(add_help=False)
     pre_parser.add_argument('--config')
     pre_parser.add_argument('--sync-config', action='store_true')
+    pre_parser.add_argument('--open', action='store_true')
     pre_args, _ = pre_parser.parse_known_args()
 
     stash = SendStash(config_path=pre_args.config)
+
+    if pre_args.open:
+        stash.open_folder()
+        return
 
     if pre_args.sync_config:
         stash.sync_config()
@@ -545,6 +589,7 @@ def main():
     )
     parser.add_argument('--config', help="Path to config.yaml")
     parser.add_argument('--sync-config', action='store_true', help="Sync the configuration from its source before running the command")
+    parser.add_argument('--open', action='store_true', help="Open the SendStash directory in file explorer")
 
     subparsers = parser.add_subparsers(dest='command', help="Available commands")
 
