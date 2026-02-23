@@ -914,6 +914,49 @@ class SendStash:
 
         return patches
 
+    def list_global(self):
+        """List patches for all configured projects."""
+        configured = self.config.get('projects', {})
+        if not configured:
+            print("No projects configured.")
+            return
+
+        total_patches = 0
+
+        for proj_name, proj_info in configured.items():
+            proj_path = proj_info['path']
+            if not os.path.isdir(proj_path):
+                continue
+
+            self.project_path = proj_path
+
+            try:
+                repo_name = self._get_repo_name()
+            except SystemExit:
+                continue
+
+            patches = self._list_patches_raw(repo_name)
+            if not patches:
+                continue
+
+            messages = self._fetch_messages(repo_name, patches)
+
+            print(f"\n{'='*60}")
+            print(f"{proj_name} ({len(patches)} patch(es))")
+            print(f"{'='*60}")
+            for i, (name, size, date) in enumerate(patches, 1):
+                stash_name, msg = messages.get(name, ('', ''))
+                display = self._format_msg_display(stash_name, msg)
+                msg_display = f'  "{display}"' if display else ''
+                print(f"  {i}. {name}  ({size} bytes, {date}){msg_display}")
+
+            total_patches += len(patches)
+
+        if total_patches == 0:
+            print("No patches found for any configured project.")
+        else:
+            print(f"\nTotal: {total_patches} patch(es)")
+
     def _parse_ls_output(self, output):
         """Parse smbclient ls output into list of (filename, size, date_string)."""
         patches = []
@@ -1343,7 +1386,9 @@ def main():
         help="Pull even if the patch hash already exists in local stashes")
 
     # list
-    subparsers.add_parser('list', parents=[project_parser], help="List available patches on the SMB share")
+    list_parser = subparsers.add_parser('list', parents=[project_parser], help="List available patches on the SMB share")
+    list_parser.add_argument('--global', dest='global_flag', action='store_true',
+        help="List patches for all configured projects")
 
     # clean
     clean_parser = subparsers.add_parser('clean', parents=[project_parser], help="Remove old patches from the SMB share")
@@ -1381,7 +1426,10 @@ def main():
         else:
             stash.pull(latest=not args.pick, pick=args.pick, number=args.number, name=args.name, apply_to_workdir=args.apply, force=args.force)
     elif args.command == 'list':
-        stash.list_patches()
+        if hasattr(args, 'global_flag') and args.global_flag:
+            stash.list_global()
+        else:
+            stash.list_patches()
     elif args.command == 'clean':
         if hasattr(args, 'global_flag') and args.global_flag:
             if args.pick:
