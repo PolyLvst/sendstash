@@ -565,7 +565,7 @@ class SendStash:
             if os.path.exists(temp_path):
                 os.unlink(temp_path)
 
-    def clean(self, all_patches=False, older_than=None):
+    def clean(self, all_patches=False, older_than=None, pick=False):
         """Remove old patches from the SMB share for the current repo."""
         repo_name = self._get_repo_name()
         remote_dir = self._get_remote_dir()
@@ -585,7 +585,29 @@ class SendStash:
 
         to_delete = []
 
-        if all_patches:
+        if pick:
+            messages = self._fetch_messages(repo_name, patches)
+
+            print(f"Available patches for '{repo_name}':")
+            for i, (name, size, date) in enumerate(patches, 1):
+                msg = messages.get(name, '')
+                msg_display = f'  "{msg}"' if msg else ''
+                print(f"  {i}. {name}  ({size} bytes, {date}){msg_display}")
+
+            try:
+                raw = input("\nSelect patch numbers to delete (comma-separated, e.g. 1,3,5): ")
+                choices = [int(x.strip()) for x in raw.split(',')]
+            except (ValueError, EOFError):
+                print("Invalid input.")
+                return
+
+            for c in choices:
+                if c < 1 or c > len(patches):
+                    print(f"Invalid selection: {c} (must be 1-{len(patches)})")
+                    return
+
+            to_delete = [patches[c - 1][0] for c in choices]
+        elif all_patches:
             to_delete = [p[0] for p in patches]
         elif older_than is not None:
             cutoff = datetime.now() - timedelta(days=older_than)
@@ -691,6 +713,7 @@ def main():
     clean_group = clean_parser.add_mutually_exclusive_group(required=True)
     clean_group.add_argument('--all', action='store_true', help="Remove all patches for the current repo")
     clean_group.add_argument('--older-than', type=int, metavar='DAYS', help="Remove patches older than N days")
+    clean_group.add_argument('--pick', action='store_true', help="Interactively choose patches to delete")
 
     args = parser.parse_args()
 
@@ -711,7 +734,7 @@ def main():
     elif args.command == 'list':
         stash.list_patches()
     elif args.command == 'clean':
-        stash.clean(all_patches=args.all, older_than=args.older_than)
+        stash.clean(all_patches=args.all, older_than=args.older_than, pick=args.pick)
 
 
 if __name__ == '__main__':
