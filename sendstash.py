@@ -186,6 +186,83 @@ class SendStash:
         """Get the working directory — project path if set, otherwise current dir."""
         return self.project_path or None
 
+    def _scan_repos_with_stashes(self):
+        """Scan {root}/projects/*/ for git repos that have stashes.
+        Returns [(dir_name, path, stash_count)] for repos WITH stashes."""
+        root = os.path.expanduser(self.config.get('root', ''))
+        projects_dir = os.path.join(root, 'projects')
+        if not os.path.isdir(projects_dir):
+            print(f"Projects directory not found: {projects_dir}")
+            return []
+
+        results = []
+        for entry in sorted(os.listdir(projects_dir)):
+            repo_path = os.path.join(projects_dir, entry)
+            if not os.path.isdir(os.path.join(repo_path, '.git')):
+                continue
+            result = self._run_command('git stash list', cwd=repo_path, capture=True)
+            if result.returncode != 0 or not result.stdout.strip():
+                continue
+            stash_count = len(result.stdout.strip().split('\n'))
+            results.append((entry, repo_path, stash_count))
+
+        return results
+
+    def _ensure_projects_in_config(self, repos):
+        """Check scanned repos against config and prompt to add new ones."""
+        configured = set(self.config.get('projects', {}).keys())
+        new_repos = [(name, path) for name, path, _ in repos if name not in configured]
+
+        if not new_repos:
+            return
+
+        print(f"\nFound {len(new_repos)} repo(s) not in config:")
+        for name, path in new_repos:
+            print(f"  - {name}")
+
+        try:
+            choice = input("\n[a]dd all / [s]elect individually / [n]one: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+
+        to_add = []
+        if choice == 'a':
+            to_add = new_repos
+        elif choice == 's':
+            for name, path in new_repos:
+                try:
+                    yn = input(f"  Add '{name}'? [y/n]: ").strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    print()
+                    break
+                if yn == 'y':
+                    to_add.append((name, path))
+        else:
+            return
+
+        if not to_add:
+            return
+
+        # Read raw config, append new projects, write back
+        root = self.config.get('root', '~/Dev')
+        with open(self.config_path, 'r') as f:
+            raw_config = yaml.safe_load(f)
+
+        if 'projects' not in raw_config:
+            raw_config['projects'] = {}
+
+        for name, path in to_add:
+            raw_config['projects'][name] = {'path': '{root}/projects/' + name}
+            print(f"  Added: {name}")
+
+        with open(self.config_path, 'w') as f:
+            yaml.safe_dump(raw_config, f, sort_keys=False)
+
+        # Reload config
+        self.config = self._load_config(self.config_path)
+        print(f"Config updated and reloaded ({len(to_add)} project(s) added).")
+
     def _get_repo_name(self):
         """Derive repo name from current git repo's root directory name."""
         result = self._run_command('git rev-parse --show-toplevel', cwd=self._get_cwd(), capture=True)
@@ -613,6 +690,45 @@ class SendStash:
             print(f"\n--- Pushing {ref} ---")
             self.push(message=message, stash_ref=ref, force=True)
 
+    def push_global(self, force=False, message=None):
+        """Push stashes from all repos under the configured root."""
+        repos = self._scan_repos_with_stashes()
+        if not repos:
+            print("No repos with stashes found under projects directory.")
+            return
+
+        print(f"Found {len(repos)} repo(s) with stashes:")
+        for name, path, count in repos:
+            print(f"  {name}: {count} stash(es)")
+
+        self._ensure_projects_in_config(repos)
+
+        configured = self.config.get('projects', {})
+        stashed_names = {name for name, _, _ in repos}
+
+        success = 0
+        failed = 0
+
+        for proj_name, proj_info in configured.items():
+            if proj_name not in stashed_names:
+                continue
+            print(f"\n{'='*60}")
+            print(f"Pushing stashes for: {proj_name}")
+            print(f"{'='*60}")
+            self.project_path = proj_info['path']
+            try:
+                self.push_all(message=message, force=force)
+                success += 1
+            except SystemExit:
+                print(f"Failed to push stashes for {proj_name}")
+                failed += 1
+            except Exception as e:
+                print(f"Error pushing {proj_name}: {e}")
+                failed += 1
+
+        print(f"\n--- Global push summary ---")
+        print(f"  Success: {success}, Failed: {failed}")
+
     def push(self, message=None, stash_ref='stash@{0}', force=False, pick=False):
         """Push a stash patch to the SMB share."""
         # Interactive pick mode
@@ -652,17 +768,26 @@ class SendStash:
                     print("Use --force to push anyway.")
                     return
 
-        # Generate the patch from stash
-        result = self._run_command(f'git stash show -p "{stash_ref}"', cwd=self._get_cwd(), capture=True)
+        # Generate the patch from stash (include untracked files if present)
+        result = self._run_command(
+            f'git stash show -p --include-untracked "{stash_ref}"',
+            cwd=self._get_cwd(), capture=True
+        )
+        if result.returncode != 0:
+            # Fall back to without --include-untracked for older git versions
+            result = self._run_command(
+                f'git stash show -p "{stash_ref}"',
+                cwd=self._get_cwd(), capture=True
+            )
         if result.returncode != 0:
             print(f"Error: Could not generate patch from {stash_ref}")
             print(result.stderr)
-            sys.exit(1)
+            return
 
         patch_content = result.stdout
         if not patch_content.strip():
-            print(f"Error: Empty patch from {stash_ref}")
-            sys.exit(1)
+            print(f"Warning: Empty patch from {stash_ref}, skipping.")
+            return
 
         # Get stash name from git for the filename
         stash_name = self._get_stash_message(stash_ref)
@@ -983,6 +1108,40 @@ class SendStash:
             summary += f" ({skipped_count} skipped as duplicates)"
         print(summary)
 
+    def pull_global(self, force=False):
+        """Pull all patches for all configured projects."""
+        configured = self.config.get('projects', {})
+        if not configured:
+            print("No projects configured.")
+            return
+
+        success = 0
+        skipped = 0
+        failed = 0
+
+        for proj_name, proj_info in configured.items():
+            proj_path = proj_info['path']
+            if not os.path.isdir(proj_path):
+                print(f"\nSkipping {proj_name}: path does not exist ({proj_path})")
+                skipped += 1
+                continue
+            print(f"\n{'='*60}")
+            print(f"Pulling patches for: {proj_name}")
+            print(f"{'='*60}")
+            self.project_path = proj_path
+            try:
+                self.pull_all(force=force)
+                success += 1
+            except SystemExit:
+                print(f"Failed to pull patches for {proj_name}")
+                failed += 1
+            except Exception as e:
+                print(f"Error pulling {proj_name}: {e}")
+                failed += 1
+
+        print(f"\n--- Global pull summary ---")
+        print(f"  Success: {success}, Skipped: {skipped}, Failed: {failed}")
+
     def clean(self, all_patches=False, older_than=None, pick=False):
         """Remove old patches from the SMB share for the current repo."""
         repo_name = self._get_repo_name()
@@ -1088,6 +1247,8 @@ def main():
     push_stash_group.add_argument('--stash', default='stash@{0}', help="Stash reference (default: stash@{0})")
     push_stash_group.add_argument('--stash-all', action='store_true', help="Push all stash entries")
     push_stash_group.add_argument('--pick', action='store_true', help="Interactively choose which stash to push")
+    push_stash_group.add_argument('--global', dest='global_flag', action='store_true',
+        help="Push stashes from all repos under the configured root")
     push_parser.add_argument('--force', action='store_true',
         help="Push even if the stash hash already exists on the remote")
 
@@ -1099,6 +1260,8 @@ def main():
     pull_group.add_argument('--number', '-n', type=int, help="Pull patch by its list number")
     pull_group.add_argument('--name', help="Pull patch by name substring match")
     pull_group.add_argument('--all', action='store_true', help="Pull all patches as stash entries")
+    pull_group.add_argument('--global', dest='global_flag', action='store_true',
+        help="Pull all patches for all configured projects")
     pull_parser.add_argument('--apply', action='store_true',
         help="Apply patch to working directory instead of restoring as stash entry")
     pull_parser.add_argument('--force', action='store_true',
@@ -1120,16 +1283,23 @@ def main():
         parser.print_help()
         return
 
+    if hasattr(args, 'global_flag') and args.global_flag and args.project:
+        parser.error("--global and --project cannot be used together")
+
     if args.project:
         stash.set_project(args.project)
 
     if args.command == 'push':
-        if args.stash_all:
+        if hasattr(args, 'global_flag') and args.global_flag:
+            stash.push_global(force=args.force, message=args.message)
+        elif args.stash_all:
             stash.push_all(message=args.message, force=args.force)
         else:
             stash.push(message=args.message, stash_ref=args.stash, force=args.force, pick=args.pick)
     elif args.command == 'pull':
-        if args.all:
+        if hasattr(args, 'global_flag') and args.global_flag:
+            stash.pull_global(force=args.force)
+        elif args.all:
             stash.pull_all(force=args.force)
         else:
             stash.pull(latest=not args.pick, pick=args.pick, number=args.number, name=args.name, apply_to_workdir=args.apply, force=args.force)
