@@ -1204,6 +1204,81 @@ class SendStash:
         for name in to_delete:
             print(f"  - {name}")
 
+    def clean_global(self, older_than=None):
+        """Clean patches for all configured projects."""
+        configured = self.config.get('projects', {})
+        if not configured:
+            print("No projects configured.")
+            return
+
+        success = 0
+        skipped = 0
+        failed = 0
+        total_cleaned = 0
+
+        for proj_name, proj_info in configured.items():
+            proj_path = proj_info['path']
+            if not os.path.isdir(proj_path):
+                print(f"\nSkipping {proj_name}: path does not exist ({proj_path})")
+                skipped += 1
+                continue
+
+            self.project_path = proj_path
+
+            try:
+                repo_name = self._get_repo_name()
+            except SystemExit:
+                print(f"Skipping {proj_name}: not a git repository")
+                skipped += 1
+                continue
+
+            patches = self._list_patches_raw(repo_name)
+            if not patches:
+                print(f"\n{proj_name}: no patches on remote")
+                skipped += 1
+                continue
+
+            if older_than is not None:
+                cutoff = datetime.now() - timedelta(days=older_than)
+                to_delete = []
+                for name, size, date in patches:
+                    ts_match = re.search(r'(\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})\.patch$', name)
+                    if ts_match:
+                        try:
+                            patch_time = datetime.strptime(ts_match.group(1), '%Y-%m-%d_%H-%M-%S')
+                            if patch_time < cutoff:
+                                to_delete.append(name)
+                        except ValueError:
+                            continue
+            else:
+                to_delete = [p[0] for p in patches]
+
+            if not to_delete:
+                print(f"\n{proj_name}: no patches to clean")
+                skipped += 1
+                continue
+
+            print(f"\n{'='*60}")
+            print(f"Cleaning {len(to_delete)} patch(es) from: {proj_name}")
+            print(f"{'='*60}")
+
+            try:
+                self._delete_patches(repo_name, to_delete)
+                for name in to_delete:
+                    print(f"  - {name}")
+                total_cleaned += len(to_delete)
+                success += 1
+            except SystemExit:
+                print(f"Failed to clean patches for {proj_name}")
+                failed += 1
+            except Exception as e:
+                print(f"Error cleaning {proj_name}: {e}")
+                failed += 1
+
+        print(f"\n--- Global clean summary ---")
+        print(f"  Cleaned: {total_cleaned} patch(es) across {success} project(s)")
+        print(f"  Skipped: {skipped}, Failed: {failed}")
+
 
 def main():
     # Pre-parse --config so we can load projects before building the full parser
@@ -1272,7 +1347,9 @@ def main():
 
     # clean
     clean_parser = subparsers.add_parser('clean', parents=[project_parser], help="Remove old patches from the SMB share")
-    clean_group = clean_parser.add_mutually_exclusive_group(required=True)
+    clean_parser.add_argument('--global', dest='global_flag', action='store_true',
+        help="Clean patches for all configured projects (cleans all by default, combine with --older-than to filter)")
+    clean_group = clean_parser.add_mutually_exclusive_group()
     clean_group.add_argument('--all', action='store_true', help="Remove all patches for the current repo")
     clean_group.add_argument('--older-than', type=int, metavar='DAYS', help="Remove patches older than N days")
     clean_group.add_argument('--pick', action='store_true', help="Interactively choose patches to delete")
@@ -1306,7 +1383,14 @@ def main():
     elif args.command == 'list':
         stash.list_patches()
     elif args.command == 'clean':
-        stash.clean(all_patches=args.all, older_than=args.older_than, pick=args.pick)
+        if hasattr(args, 'global_flag') and args.global_flag:
+            if args.pick:
+                parser.error("--global and --pick cannot be used together")
+            stash.clean_global(older_than=args.older_than)
+        elif not args.all and args.older_than is None and not args.pick:
+            parser.error("clean requires one of: --all, --older-than, --pick, or --global")
+        else:
+            stash.clean(all_patches=args.all, older_than=args.older_than, pick=args.pick)
 
 
 if __name__ == '__main__':
