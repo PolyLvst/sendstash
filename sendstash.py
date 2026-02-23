@@ -95,22 +95,22 @@ class SendStash:
             sys.exit(1)
         print(f"Using project: {project_name} ({self.project_path})")
 
-    def _run_command(self, command, cwd=None, interactive=False, capture=False):
+    def _run_command(self, command, cwd=None, interactive=False, capture=False, env=None):
         """Runs a command and streams its output."""
         if capture:
             result = subprocess.run(
                 command, cwd=cwd, shell=isinstance(command, str),
-                capture_output=True, text=True
+                capture_output=True, text=True, env=env
             )
             return result
         elif interactive:
-            process = subprocess.Popen(command, cwd=cwd, shell=isinstance(command, str))
+            process = subprocess.Popen(command, cwd=cwd, shell=isinstance(command, str), env=env)
             process.wait()
             return process.returncode
         else:
             process = subprocess.Popen(
                 command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                universal_newlines=True, cwd=cwd, shell=isinstance(command, str)
+                universal_newlines=True, cwd=cwd, shell=isinstance(command, str), env=env
             )
             for line in process.stdout:
                 print(line, end='')
@@ -469,6 +469,97 @@ class SendStash:
             return ''
         return result.stdout.strip()
 
+    def _inject_stash_from_patch(self, patch_path, stash_msg):
+        """Inject a stash entry directly from a patch file without touching the working directory."""
+        cwd = self._get_cwd()
+
+        # Get HEAD commit hash and tree
+        head_result = self._run_command('git rev-parse HEAD', cwd=cwd, capture=True)
+        if head_result.returncode != 0:
+            print("Error: Could not resolve HEAD.")
+            return False
+        head = head_result.stdout.strip()
+
+        head_tree_result = self._run_command('git rev-parse HEAD^{tree}', cwd=cwd, capture=True)
+        if head_tree_result.returncode != 0:
+            print("Error: Could not resolve HEAD tree.")
+            return False
+        head_tree = head_tree_result.stdout.strip()
+
+        # Get branch name
+        branch_result = self._run_command('git branch --show-current', cwd=cwd, capture=True)
+        branch = branch_result.stdout.strip() if branch_result.returncode == 0 and branch_result.stdout.strip() else 'detached'
+
+        # Get short HEAD description
+        head_short_result = self._run_command("git log -1 --format='%h %s' HEAD", cwd=cwd, capture=True)
+        head_short = head_short_result.stdout.strip().strip("'") if head_short_result.returncode == 0 else head[:7]
+
+        # Create I commit (index state — identical to HEAD tree since we only modify W)
+        i_msg = f"index on {branch}: {head_short}"
+        i_result = self._run_command(
+            f'git commit-tree {head_tree} -p {head} -m "{i_msg}"',
+            cwd=cwd, capture=True
+        )
+        if i_result.returncode != 0:
+            print("Error creating index commit:")
+            print(i_result.stderr)
+            return False
+        i_commit = i_result.stdout.strip()
+
+        # Create temporary index file
+        tmp_index = tempfile.mktemp(prefix='sendstash_idx_')
+        tmp_env = dict(os.environ, GIT_INDEX_FILE=tmp_index)
+
+        try:
+            # Populate temp index with HEAD's tree
+            r = self._run_command('git read-tree HEAD', cwd=cwd, capture=True, env=tmp_env)
+            if r.returncode != 0:
+                print("Error populating temp index:")
+                print(r.stderr)
+                return False
+
+            # Apply patch to temp index
+            r = self._run_command(f'git apply --cached {patch_path}', cwd=cwd, capture=True, env=tmp_env)
+            if r.returncode != 0:
+                print("Error applying patch to index:")
+                print(r.stderr)
+                return False
+
+            # Write tree from temp index
+            r = self._run_command('git write-tree', cwd=cwd, capture=True, env=tmp_env)
+            if r.returncode != 0:
+                print("Error writing tree:")
+                print(r.stderr)
+                return False
+            w_tree = r.stdout.strip()
+        finally:
+            if os.path.exists(tmp_index):
+                os.unlink(tmp_index)
+
+        # Create W commit (working tree state)
+        w_msg = f"On {branch}: {stash_msg}" if stash_msg else f"On {branch}: WIP"
+        w_result = self._run_command(
+            f'git commit-tree {w_tree} -p {head} -p {i_commit} -m "{w_msg}"',
+            cwd=cwd, capture=True
+        )
+        if w_result.returncode != 0:
+            print("Error creating working-tree commit:")
+            print(w_result.stderr)
+            return False
+        w_commit = w_result.stdout.strip()
+
+        # Store as stash entry
+        store_result = self._run_command(
+            f'git stash store -m "{w_msg}" {w_commit}',
+            cwd=cwd, capture=True
+        )
+        if store_result.returncode != 0:
+            print("Error storing stash:")
+            print(store_result.stderr)
+            return False
+
+        return True
+
     def _get_remote_hashes(self):
         """Get the set of stash hashes already present on the SMB share."""
         repo_name = self._get_repo_name()
@@ -559,9 +650,9 @@ class SendStash:
             f.write(patch_content)
             temp_patch_path = f.name
 
-        # Write message to temp file
+        # Write message to temp file (with stash_name header)
         with tempfile.NamedTemporaryFile(mode='w', suffix='.msg', delete=False) as f:
-            f.write(message)
+            f.write(f"stash_name: {stash_name}\n---\n{message}")
             temp_msg_path = f.name
 
         try:
@@ -573,8 +664,36 @@ class SendStash:
             os.unlink(temp_patch_path)
             os.unlink(temp_msg_path)
 
+    def _parse_msg_file(self, content):
+        """Parse .msg file content. Returns (stash_name, message).
+
+        New format:
+            stash_name: WIP on login feature
+            ---
+            User's custom message here
+
+        Old format (backward compat): entire content is the message, stash_name is empty.
+        """
+        if '---' in content:
+            header, _, body = content.partition('---')
+            stash_name = ''
+            for line in header.strip().split('\n'):
+                if line.startswith('stash_name:'):
+                    stash_name = line[len('stash_name:'):].strip()
+                    break
+            return (stash_name, body.strip())
+        return ('', content.strip())
+
+    def _format_msg_display(self, stash_name, message):
+        """Format stash_name and message for display."""
+        if stash_name and message and stash_name != message:
+            return f'{stash_name} \u2014 {message}'
+        if stash_name:
+            return stash_name
+        return message
+
     def _fetch_messages(self, repo_name, patches):
-        """Batch-download .msg files for a list of patches. Returns dict of patch_name -> message."""
+        """Batch-download .msg files for a list of patches. Returns dict of patch_name -> (stash_name, message)."""
         backend, _ = self._detect_backend()
         messages = {}
 
@@ -584,7 +703,7 @@ class SendStash:
                 msg_path = self._get_share_path(repo_name, f"{base}.msg")
                 if os.path.exists(msg_path):
                     with open(msg_path, 'r') as f:
-                        messages[name] = f.read().strip()
+                        messages[name] = self._parse_msg_file(f.read())
         else:
             remote_dir = self._get_remote_dir()
             with tempfile.TemporaryDirectory() as tmpdir:
@@ -601,7 +720,7 @@ class SendStash:
                     msg_path = os.path.join(tmpdir, f"{base}.msg")
                     if os.path.exists(msg_path):
                         with open(msg_path, 'r') as f:
-                            messages[name] = f.read().strip()
+                            messages[name] = self._parse_msg_file(f.read())
 
         return messages
 
@@ -620,8 +739,9 @@ class SendStash:
 
         print(f"Patches for '{repo_name}':")
         for i, (name, size, date) in enumerate(patches, 1):
-            msg = messages.get(name, '')
-            msg_display = f'  "{msg}"' if msg else ''
+            stash_name, msg = messages.get(name, ('', ''))
+            display = self._format_msg_display(stash_name, msg)
+            msg_display = f'  "{display}"' if display else ''
             print(f"  {i}. {name}  ({size} bytes, {date}){msg_display}")
 
         return patches
@@ -651,8 +771,8 @@ class SendStash:
         patches.sort(key=lambda x: x[0])
         return patches
 
-    def pull(self, latest=True, pick=False, number=None, name=None):
-        """Pull a stash patch from the SMB share and apply it."""
+    def pull(self, latest=True, pick=False, number=None, name=None, apply_to_workdir=False):
+        """Pull a stash patch from the SMB share and restore it as a stash entry (or apply directly with --apply)."""
         repo_name = self._get_repo_name()
 
         patches = self._list_patches_raw(repo_name)
@@ -660,14 +780,17 @@ class SendStash:
             print(f"No patches found for repo '{repo_name}'.")
             return
 
+        # Fetch messages (needed for display and stash-restore)
+        messages = self._fetch_messages(repo_name, patches)
+
         if number is not None:
             if number < 1 or number > len(patches):
                 print(f"Invalid patch number: {number}. Must be between 1 and {len(patches)}.")
                 return
             selected = patches[number - 1]
-            messages = self._fetch_messages(repo_name, patches)
-            msg = messages.get(selected[0], '')
-            msg_display = f'  "{msg}"' if msg else ''
+            stash_name, msg = messages.get(selected[0], ('', ''))
+            display = self._format_msg_display(stash_name, msg)
+            msg_display = f'  "{display}"' if display else ''
             print(f"Selected patch {number}: {selected[0]}{msg_display}")
         elif name is not None:
             matches = [(i, p) for i, p in enumerate(patches, 1) if name.lower() in p[0].lower()]
@@ -675,29 +798,27 @@ class SendStash:
                 print(f"No patches matching '{name}'.")
                 return
             if len(matches) > 1:
-                messages = self._fetch_messages(repo_name, patches)
                 print(f"Multiple patches match '{name}':")
                 for i, (num, (pname, size, date)) in enumerate(matches):
-                    msg = messages.get(pname, '')
-                    msg_display = f'  "{msg}"' if msg else ''
+                    stash_name, msg = messages.get(pname, ('', ''))
+                    display = self._format_msg_display(stash_name, msg)
+                    msg_display = f'  "{display}"' if display else ''
                     print(f"  {num}. {pname}  ({size} bytes, {date}){msg_display}")
                 print("Please be more specific.")
                 return
             selected = matches[0][1]
-            messages = self._fetch_messages(repo_name, patches)
-            msg = messages.get(selected[0], '')
-            msg_display = f'  "{msg}"' if msg else ''
+            stash_name, msg = messages.get(selected[0], ('', ''))
+            display = self._format_msg_display(stash_name, msg)
+            msg_display = f'  "{display}"' if display else ''
             print(f"Selected patch: {selected[0]}{msg_display}")
         elif pick:
-            # Fetch messages for display
-            messages = self._fetch_messages(repo_name, patches)
-
             # Show list and let user choose
             print(f"Available patches for '{repo_name}':")
-            for i, (name, size, date) in enumerate(patches, 1):
-                msg = messages.get(name, '')
-                msg_display = f'  "{msg}"' if msg else ''
-                print(f"  {i}. {name}  ({size} bytes, {date}){msg_display}")
+            for i, (pname, size, date) in enumerate(patches, 1):
+                stash_name, msg = messages.get(pname, ('', ''))
+                display = self._format_msg_display(stash_name, msg)
+                msg_display = f'  "{display}"' if display else ''
+                print(f"  {i}. {pname}  ({size} bytes, {date}){msg_display}")
 
             try:
                 choice = int(input("\nSelect patch number: "))
@@ -713,6 +834,8 @@ class SendStash:
             selected = patches[-1]
 
         patch_name = selected[0]
+        selected_stash_name, selected_msg = messages.get(patch_name, ('', ''))
+
         print(f"Downloading: {patch_name}")
 
         # Download patch to temp file
@@ -725,15 +848,27 @@ class SendStash:
             except RuntimeError:
                 return
 
-            # Apply the patch
-            apply_result = self._run_command(f'git apply {temp_path}', cwd=self._get_cwd(), capture=True)
-            if apply_result.returncode != 0:
-                print("Error applying patch:")
-                print(apply_result.stderr)
-                print("\nPatch saved at:", temp_path)
-                return
+            if apply_to_workdir:
+                # Apply directly to working directory
+                apply_result = self._run_command(f'git apply {temp_path}', cwd=self._get_cwd(), capture=True)
+                if apply_result.returncode != 0:
+                    print("Error applying patch:")
+                    print(apply_result.stderr)
+                    print("\nPatch saved at:", temp_path)
+                    return
+                print(f"Successfully applied patch: {patch_name}")
+            else:
+                # Stash-restore mode: inject stash directly without touching working directory
+                stash_label = selected_stash_name or selected_msg
+                if not self._inject_stash_from_patch(temp_path, stash_label):
+                    print("\nPatch saved at:", temp_path)
+                    return
 
-            print(f"Successfully applied patch: {patch_name}")
+                print(f"Restored stash: {stash_label or patch_name}")
+                # Show top stash entry
+                list_result = self._run_command('git stash list -1', cwd=self._get_cwd(), capture=True)
+                if list_result.returncode == 0 and list_result.stdout.strip():
+                    print(list_result.stdout.strip())
         finally:
             if os.path.exists(temp_path):
                 os.unlink(temp_path)
@@ -754,8 +889,9 @@ class SendStash:
 
             print(f"Available patches for '{repo_name}':")
             for i, (name, size, date) in enumerate(patches, 1):
-                msg = messages.get(name, '')
-                msg_display = f'  "{msg}"' if msg else ''
+                stash_name, msg = messages.get(name, ('', ''))
+                display = self._format_msg_display(stash_name, msg)
+                msg_display = f'  "{display}"' if display else ''
                 print(f"  {i}. {name}  ({size} bytes, {date}){msg_display}")
 
             try:
@@ -849,6 +985,8 @@ def main():
     pull_group.add_argument('--pick', action='store_true', help="Interactively choose which patch to apply")
     pull_group.add_argument('--number', '-n', type=int, help="Pull patch by its list number")
     pull_group.add_argument('--name', help="Pull patch by name substring match")
+    pull_parser.add_argument('--apply', action='store_true',
+        help="Apply patch to working directory instead of restoring as stash entry")
 
     # list
     subparsers.add_parser('list', parents=[project_parser], help="List available patches on the SMB share")
@@ -875,7 +1013,7 @@ def main():
         else:
             stash.push(message=args.message, stash_ref=args.stash)
     elif args.command == 'pull':
-        stash.pull(latest=not args.pick, pick=args.pick, number=args.number, name=args.name)
+        stash.pull(latest=not args.pick, pick=args.pick, number=args.number, name=args.name, apply_to_workdir=args.apply)
     elif args.command == 'list':
         stash.list_patches()
     elif args.command == 'clean':
