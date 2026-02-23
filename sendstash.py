@@ -199,6 +199,29 @@ class SendStash:
                 return ''
         return ''
 
+    def _list_stash_refs(self):
+        """Returns a list of (ref, message) for all stash entries."""
+        result = self._run_command('git stash list', cwd=self._get_cwd(), capture=True)
+        if result.returncode != 0 or not result.stdout.strip():
+            return []
+        entries = []
+        for line in result.stdout.strip().split('\n'):
+            parts = line.split(':', 2)
+            ref = parts[0].strip()
+            message = parts[2].strip() if len(parts) >= 3 else ''
+            entries.append((ref, message))
+        return entries
+
+    def push_all(self, message=None):
+        """Push all stash entries to the SMB share."""
+        entries = self._list_stash_refs()
+        if not entries:
+            print("No stashes found.")
+            return
+        for ref, _ in entries:
+            print(f"\n--- Pushing {ref} ---")
+            self.push(message=message, stash_ref=ref)
+
     def push(self, message=None, stash_ref='stash@{0}'):
         """Push a stash patch to the SMB share."""
         repo_name = self._get_repo_name()
@@ -535,7 +558,9 @@ def main():
     # push
     push_parser = subparsers.add_parser('push', parents=[project_parser], help="Push a stash patch to the SMB share")
     push_parser.add_argument('--message', '-m', help="Optional message/description for the patch")
-    push_parser.add_argument('--stash', default='stash@{0}', help="Stash reference (default: stash@{0})")
+    push_stash_group = push_parser.add_mutually_exclusive_group()
+    push_stash_group.add_argument('--stash', default='stash@{0}', help="Stash reference (default: stash@{0})")
+    push_stash_group.add_argument('--stash-all', action='store_true', help="Push all stash entries")
 
     # pull
     pull_parser = subparsers.add_parser('pull', parents=[project_parser], help="Pull and apply a stash patch from the SMB share")
@@ -562,7 +587,10 @@ def main():
         stash.set_project(args.project)
 
     if args.command == 'push':
-        stash.push(message=args.message, stash_ref=args.stash)
+        if args.stash_all:
+            stash.push_all(message=args.message)
+        else:
+            stash.push(message=args.message, stash_ref=args.stash)
     elif args.command == 'pull':
         stash.pull(latest=not args.pick, pick=args.pick)
     elif args.command == 'list':
