@@ -423,7 +423,7 @@ class SendStash:
         patches.sort(key=lambda x: x[0])
         return patches
 
-    def pull(self, latest=True, pick=False):
+    def pull(self, latest=True, pick=False, number=None, name=None):
         """Pull a stash patch from the SMB share and apply it."""
         repo_name = self._get_repo_name()
         remote_dir = self._get_remote_dir()
@@ -441,7 +441,35 @@ class SendStash:
             print(f"No patches found for repo '{repo_name}'.")
             return
 
-        if pick:
+        if number is not None:
+            if number < 1 or number > len(patches):
+                print(f"Invalid patch number: {number}. Must be between 1 and {len(patches)}.")
+                return
+            selected = patches[number - 1]
+            messages = self._fetch_messages(repo_name, patches)
+            msg = messages.get(selected[0], '')
+            msg_display = f'  "{msg}"' if msg else ''
+            print(f"Selected patch {number}: {selected[0]}{msg_display}")
+        elif name is not None:
+            matches = [(i, p) for i, p in enumerate(patches, 1) if name.lower() in p[0].lower()]
+            if not matches:
+                print(f"No patches matching '{name}'.")
+                return
+            if len(matches) > 1:
+                messages = self._fetch_messages(repo_name, patches)
+                print(f"Multiple patches match '{name}':")
+                for i, (num, (pname, size, date)) in enumerate(matches):
+                    msg = messages.get(pname, '')
+                    msg_display = f'  "{msg}"' if msg else ''
+                    print(f"  {num}. {pname}  ({size} bytes, {date}){msg_display}")
+                print("Please be more specific.")
+                return
+            selected = matches[0][1]
+            messages = self._fetch_messages(repo_name, patches)
+            msg = messages.get(selected[0], '')
+            msg_display = f'  "{msg}"' if msg else ''
+            print(f"Selected patch: {selected[0]}{msg_display}")
+        elif pick:
             # Fetch messages for display
             messages = self._fetch_messages(repo_name, patches)
 
@@ -612,6 +640,8 @@ def main():
     pull_group = pull_parser.add_mutually_exclusive_group()
     pull_group.add_argument('--latest', action='store_true', default=True, help="Pull the most recent patch (default)")
     pull_group.add_argument('--pick', action='store_true', help="Interactively choose which patch to apply")
+    pull_group.add_argument('--number', '-n', type=int, help="Pull patch by its list number")
+    pull_group.add_argument('--name', help="Pull patch by name substring match")
 
     # list
     subparsers.add_parser('list', parents=[project_parser], help="List available patches on the SMB share")
@@ -637,7 +667,7 @@ def main():
         else:
             stash.push(message=args.message, stash_ref=args.stash)
     elif args.command == 'pull':
-        stash.pull(latest=not args.pick, pick=args.pick)
+        stash.pull(latest=not args.pick, pick=args.pick, number=args.number, name=args.name)
     elif args.command == 'list':
         stash.list_patches()
     elif args.command == 'clean':
