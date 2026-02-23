@@ -1,0 +1,15 @@
+# SMB connection settings
+smb:
+  server: "//server/share"    # SMB share path
+  username: "user"
+  password: "password"        # or use password_cmd
+  # password_cmd: "pass show smb/stash-sync"  # alternative: command that outputs password
+  remote_dir: "stash-sync"    # base directory on the share for patches
+
+# Optional: define projects so you can use -p/--project from anywhere
+# root: ~/
+# projects:
+#   my-app:
+#     path: "{root}/projects/my-app"
+#   backend:
+#     path: "{root}/projects/backend-api"
