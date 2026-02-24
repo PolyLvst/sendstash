@@ -221,10 +221,14 @@ class SendStash:
             print(f"  - {name}")
 
         try:
-            choice = input("\n[a]dd all / [s]elect individually / [n]one: ").strip().lower()
+            choice = input("\n[a]dd all / [s]elect individually / [n]one / [q]uit: ").strip().lower()
         except (EOFError, KeyboardInterrupt):
             print()
             return
+
+        if choice == 'q':
+            print("Quitting.")
+            sys.exit(0)
 
         to_add = []
         if choice == 'a':
