@@ -13,14 +13,35 @@ from datetime import datetime, timedelta
 
 
 class SendStash:
+    # ANSI color codes (auto-disabled when not a TTY)
+    _COLORS = {
+        'reset': '\033[0m',
+        'bold': '\033[1m',
+        'dim': '\033[2m',
+        'red': '\033[31m',
+        'green': '\033[32m',
+        'yellow': '\033[33m',
+        'blue': '\033[34m',
+        'cyan': '\033[36m',
+        'gray': '\033[90m',
+    }
+
+    def _c(self, color, text):
+        """Colorize text if stdout is a TTY."""
+        if not hasattr(self, '_use_color'):
+            self._use_color = sys.stdout.isatty()
+        if self._use_color and color in self._COLORS:
+            return f"{self._COLORS[color]}{text}{self._COLORS['reset']}"
+        return str(text)
+
     def __init__(self, config_path=None):
         self.config_path = self._find_config_file(config_path)
         if not self.config_path:
-            print("Error: Could not find config.yaml.")
-            print("Please place it in one of the documented locations")
+            print(f"{self._c('red', '[err]')} Could not find config.yaml")
+            print(f"     -> Place it in one of the documented locations")
             sys.exit(1)
 
-        print(f"Loading config from: {self.config_path}")
+        print(f"{self._c('blue', '[info]')} Config: {self.config_path}")
         self.config = self._load_config(self.config_path)
         self.project_path = None
 
@@ -67,7 +88,7 @@ class SendStash:
                 )
                 smb['password'] = result.stdout.strip()
             except subprocess.CalledProcessError as e:
-                print(f"Error running password_cmd: {e}")
+                print(f"{self._c('red', '[err]')} password_cmd failed: {e}")
                 sys.exit(1)
 
         # Expand project paths
@@ -86,14 +107,14 @@ class SendStash:
         """Set the working directory to a configured project's path."""
         projects = self.config.get('projects', {})
         if project_name not in projects:
-            print(f"Error: Project '{project_name}' not found in config.")
-            print(f"Available projects: {', '.join(projects.keys())}")
+            print(f"{self._c('red', '[err]')} Project '{project_name}' not found")
+            print(f"     -> Available: {', '.join(projects.keys())}")
             sys.exit(1)
         self.project_path = projects[project_name]['path']
         if not os.path.isdir(self.project_path):
-            print(f"Error: Project path does not exist: {self.project_path}")
+            print(f"{self._c('red', '[err]')} Path does not exist: {self.project_path}")
             sys.exit(1)
-        print(f"Using project: {project_name} ({self.project_path})")
+        print(f"{self._c('blue', '[info]')} Project: {project_name} ({self.project_path})")
 
     def _run_command(self, command, cwd=None, interactive=False, capture=False, env=None):
         """Runs a command and streams its output."""
@@ -120,34 +141,33 @@ class SendStash:
     def sync_config(self):
         """Syncs the configuration file itself based on 'config_sync' settings."""
         if 'config_sync' not in self.config:
-            print("Warning: --sync-config was passed, but 'config_sync' section is not defined in config.yaml.")
+            print(f"{self._c('yellow', '[warn]')} 'config_sync' section not defined in config.yaml")
             return
 
         sync_settings = self.config['config_sync']
         command = sync_settings.get('command')
 
         if not command:
-            print("Error: 'config_sync' section is missing the 'command' key.")
+            print(f"{self._c('red', '[err]')} 'config_sync' missing 'command' key")
             return
 
         config_dir = os.path.dirname(self.config_path)
 
-        print(f"Syncing configuration using command: '{command}' in '{config_dir}'")
+        print(f"{self._c('blue', '[info]')} Syncing config: '{command}' in '{config_dir}'")
         return_code = self._run_command(command, cwd=config_dir)
 
         if return_code == 0:
-            print("Configuration sync completed successfully.")
-            print("Reloading configuration...")
+            print(f"     -> Sync complete, reloading config")
             self.config = self._load_config(self.config_path)
         else:
-            print(f"Configuration sync failed with return code: {return_code}")
+            print(f"{self._c('red', '[err]')} Config sync failed (exit {return_code})")
             sys.exit(1)
 
     def open_folder(self):
         """Opens the sendstash script directory in the file explorer."""
         script_dir = os.path.dirname(os.path.realpath(__file__))
 
-        print(f"Opening SendStash directory: {script_dir}")
+        print(f"{self._c('blue', '[info]')} Opening: {script_dir}")
 
         try:
             if sys.platform == "win32":
@@ -167,20 +187,20 @@ class SendStash:
                         continue
 
                 if not opened:
-                    print("Could not find a suitable file manager. Directory path:")
-                    print(f"  {script_dir}")
+                    print(f"{self._c('yellow', '[warn]')} No file manager found")
+                    print(f"     -> {script_dir}")
                     return
             else:
-                print(f"Unsupported platform: {sys.platform}")
-                print(f"SendStash directory: {script_dir}")
+                print(f"{self._c('yellow', '[warn]')} Unsupported platform: {sys.platform}")
+                print(f"     -> {script_dir}")
                 return
 
         except subprocess.CalledProcessError as e:
-            print(f"Error opening folder: {e}")
-            print(f"SendStash directory: {script_dir}")
+            print(f"{self._c('red', '[err]')} {e}")
+            print(f"     -> {script_dir}")
         except Exception as e:
-            print(f"Unexpected error: {e}")
-            print(f"SendStash directory: {script_dir}")
+            print(f"{self._c('red', '[err]')} {e}")
+            print(f"     -> {script_dir}")
 
     def _get_cwd(self):
         """Get the working directory — project path if set, otherwise current dir."""
@@ -192,7 +212,7 @@ class SendStash:
         root = os.path.expanduser(self.config.get('root', ''))
         projects_dir = os.path.join(root, 'projects')
         if not os.path.isdir(projects_dir):
-            print(f"Projects directory not found: {projects_dir}")
+            print(f"{self._c('yellow', '[warn]')} Projects dir not found: {projects_dir}")
             return []
 
         results = []
@@ -216,7 +236,7 @@ class SendStash:
         if not new_repos:
             return
 
-        print(f"\nFound {len(new_repos)} repo(s) not in config:")
+        print(f"\n{self._c('blue', '[info]')} {len(new_repos)} repo(s) not in config:")
         for name, path in new_repos:
             print(f"  - {name}")
 
@@ -258,20 +278,20 @@ class SendStash:
 
         for name, path in to_add:
             raw_config['projects'][name] = {'path': '{root}/projects/' + name}
-            print(f"  Added: {name}")
+            print(f"  {self._c('green', '[+]')} {name}")
 
         with open(self.config_path, 'w') as f:
             yaml.safe_dump(raw_config, f, sort_keys=False)
 
         # Reload config
         self.config = self._load_config(self.config_path)
-        print(f"Config updated and reloaded ({len(to_add)} project(s) added).")
+        print(f"{self._c('blue', '[info]')} Config reloaded ({len(to_add)} added)")
 
     def _get_repo_name(self):
         """Derive repo name from current git repo's root directory name."""
         result = self._run_command('git rev-parse --show-toplevel', cwd=self._get_cwd(), capture=True)
         if result.returncode != 0:
-            print("Error: Not inside a git repository.")
+            print(f"{self._c('red', '[err]')} Not inside a git repository")
             sys.exit(1)
         return os.path.basename(result.stdout.strip())
 
@@ -279,7 +299,7 @@ class SendStash:
         """Get the current branch name."""
         result = self._run_command('git rev-parse --abbrev-ref HEAD', cwd=self._get_cwd(), capture=True)
         if result.returncode != 0:
-            print("Error: Could not determine current branch.")
+            print(f"{self._c('red', '[err]')} Could not determine branch")
             sys.exit(1)
         return result.stdout.strip()
 
@@ -323,7 +343,7 @@ class SendStash:
                 self._mount_root = mount_path
                 return self._backend, self._mount_root
             else:
-                print(f"Warning: Configured mount_path '{mount_path}' does not exist.")
+                print(f"{self._c('yellow', '[warn]')} mount_path '{mount_path}' does not exist")
 
         server = smb.get('server', '')
         # Parse //server/share into components
@@ -394,18 +414,18 @@ class SendStash:
         try:
             result = subprocess.run(cmd, capture_output=True, text=True)
             if result.returncode == 0 and os.path.exists(mount_path):
-                print(f"Auto-mounted SMB share at: {mount_path}")
+                print(f"{self._c('blue', '[info]')} Auto-mounted: {mount_path}")
                 return mount_path
         except (OSError, FileNotFoundError):
             pass
 
-        print("Error: Could not auto-mount the SMB share.")
+        print(f"{self._c('red', '[err]')} Could not auto-mount SMB share")
         if is_wsl:
-            print(f"  Try manually: powershell.exe -Command \"net use \\\\\\\\{host}\\\\{share} /user:{username} <password>\"")
-            print(f"  Or: sudo mount -t cifs //{host}/{share} /mnt/{host}/{share} -o username={username},password=<password>")
+            print(f"     -> Try: powershell.exe -Command \"net use \\\\\\\\{host}\\\\{share} /user:{username} <password>\"")
+            print(f"     -> Or: sudo mount -t cifs //{host}/{share} /mnt/{host}/{share} -o username={username},password=<password>")
         else:
-            print(f"  Try manually: net use \\\\{host}\\{share} /user:{username} <password>")
-        print("  Or set 'mount_path' in your config.yaml to the mount point.")
+            print(f"     -> Try: net use \\\\{host}\\{share} /user:{username} <password>")
+        print(f"     -> Or set 'mount_path' in your config.yaml to the mount point")
         sys.exit(1)
 
     def _get_share_path(self, *parts):
@@ -465,7 +485,7 @@ class SendStash:
             ]
 
             if result.returncode != 0 and real_errors:
-                print("Error uploading patch to SMB share:")
+                print(f"{self._c('red', '[err]')} Upload failed:")
                 print('\n'.join(real_errors))
                 sys.exit(1)
 
@@ -484,7 +504,7 @@ class SendStash:
             )
             result = self._smb_cmd(smb_subcmd)
             if result.returncode != 0:
-                print("Error downloading patch:")
+                print(f"{self._c('red', '[err]')} Download failed:")
                 print(result.stderr)
                 raise RuntimeError("Download failed")
 
@@ -521,7 +541,7 @@ class SendStash:
             ]
 
             if result.returncode != 0 and real_errors:
-                print("Error cleaning patches:")
+                print(f"{self._c('red', '[err]')} Clean failed:")
                 print('\n'.join(real_errors))
                 raise RuntimeError("Delete failed")
 
@@ -653,7 +673,7 @@ class SendStash:
             # Checkout HEAD's tree into temp workdir
             r = self._run_command('git checkout-index -a', cwd=cwd, capture=True, env=workdir_env)
             if r.returncode != 0:
-                print("Warning: checkout-index failed, temp workdir may be incomplete")
+                print(f"{self._c('yellow', '[warn]')} checkout-index failed, temp workdir may be incomplete")
 
             # Apply patch in the temp working directory (non-cached)
             r = self._run_command(
@@ -702,8 +722,7 @@ class SendStash:
                             return r  # nothing applied at all
 
                         if rej_files:
-                            print("Warning: patch was created against a different base.")
-                            print(f"  .rej files included in stash: {', '.join(rej_files)}")
+                            print(f"     -> {self._c('yellow', '[warn]')} Diverged base, .rej in stash: {self._c('yellow', ', '.join(rej_files))}")
 
             # Stage all changes (including new files) into the temp index
             r = self._run_command('git add -A', cwd=tmpdir, capture=True, env=workdir_env)
@@ -725,13 +744,13 @@ class SendStash:
         # Get HEAD commit hash and tree
         head_result = self._run_command('git rev-parse HEAD', cwd=cwd, capture=True)
         if head_result.returncode != 0:
-            print("Error: Could not resolve HEAD.")
+            print(f"{self._c('red', '[err]')} Could not resolve HEAD")
             return False
         head = head_result.stdout.strip()
 
         head_tree_result = self._run_command('git rev-parse HEAD:', cwd=cwd, capture=True)
         if head_tree_result.returncode != 0:
-            print("Error: Could not resolve HEAD tree.")
+            print(f"{self._c('red', '[err]')} Could not resolve HEAD tree")
             return False
         head_tree = head_tree_result.stdout.strip()
 
@@ -750,8 +769,7 @@ class SendStash:
             cwd=cwd, capture=True
         )
         if i_result.returncode != 0:
-            print("Error creating index commit:")
-            print(i_result.stderr)
+            print(f"{self._c('red', '[err]')} Index commit failed: {i_result.stderr.strip()}")
             return False
         i_commit = i_result.stdout.strip()
 
@@ -763,8 +781,7 @@ class SendStash:
             # Populate temp index with HEAD's tree
             r = self._run_command('git read-tree HEAD', cwd=cwd, capture=True, env=tmp_env)
             if r.returncode != 0:
-                print("Error populating temp index:")
-                print(r.stderr)
+                print(f"{self._c('red', '[err]')} Temp index failed: {r.stderr.strip()}")
                 return False
 
             # Apply patch to temp index (try --3way for diverged bases, --ignore-whitespace for CRLF)
@@ -776,16 +793,13 @@ class SendStash:
                 # Final fallback: apply in a temp working directory (handles new files, diverged content)
                 r = self._apply_patch_in_temp_workdir(patch_path, cwd, tmp_env)
             if r is None or (hasattr(r, 'returncode') and r.returncode != 0):
-                print("Error applying patch to index:")
-                if hasattr(r, 'stderr') and r.stderr:
-                    print(r.stderr)
+                print(f"{self._c('red', '[err]')} Patch apply failed: {r.stderr.strip() if hasattr(r, 'stderr') and r.stderr else ''}")
                 return False
 
             # Write tree from temp index
             r = self._run_command('git write-tree', cwd=cwd, capture=True, env=tmp_env)
             if r.returncode != 0:
-                print("Error writing tree:")
-                print(r.stderr)
+                print(f"{self._c('red', '[err]')} Write-tree failed: {r.stderr.strip()}")
                 return False
             w_tree = r.stdout.strip()
         finally:
@@ -799,8 +813,7 @@ class SendStash:
             cwd=cwd, capture=True
         )
         if w_result.returncode != 0:
-            print("Error creating working-tree commit:")
-            print(w_result.stderr)
+            print(f"{self._c('red', '[err]')} W-commit failed: {w_result.stderr.strip()}")
             return False
         w_commit = w_result.stdout.strip()
 
@@ -810,8 +823,7 @@ class SendStash:
             cwd=cwd, capture=True
         )
         if store_result.returncode != 0:
-            print("Error storing stash:")
-            print(store_result.stderr)
+            print(f"{self._c('red', '[err]')} Stash store failed: {store_result.stderr.strip()}")
             return False
 
         return w_commit
@@ -913,7 +925,7 @@ class SendStash:
         """Push all stash entries to the SMB share."""
         entries = self._list_stash_refs()
         if not entries:
-            print("No stashes found.")
+            print(f"{self._c('blue', '[info]')} No stashes found")
             return
 
         # Get existing patches on SMB to avoid duplicates
@@ -922,19 +934,19 @@ class SendStash:
         for ref, _ in entries:
             stash_hash = self._get_stash_hash(ref)
             if stash_hash and stash_hash in remote_hashes:
-                print(f"\n--- Skipping {ref} (already pushed: {stash_hash}) ---")
+                print(f"  {self._c('gray', '[skip]')} {ref}  (already pushed: {stash_hash})")
                 continue
-            print(f"\n--- Pushing {ref} ---")
+            print(f"\n  {self._c('cyan', '[push]')} {ref}")
             self.push(message=message, stash_ref=ref, force=True)
 
     def push_global(self, force=False, message=None):
         """Push stashes from all repos under the configured root."""
         repos = self._scan_repos_with_stashes()
         if not repos:
-            print("No repos with stashes found under projects directory.")
+            print(f"{self._c('blue', '[info]')} No repos with stashes found")
             return
 
-        print(f"Found {len(repos)} repo(s) with stashes:")
+        print(f"{self._c('blue', '[info]')} {len(repos)} repo(s) with stashes:")
         for name, path, count in repos:
             print(f"  {name}: {count} stash(es)")
 
@@ -949,22 +961,21 @@ class SendStash:
         for proj_name, proj_info in configured.items():
             if proj_name not in stashed_names:
                 continue
-            print(f"\n{'='*60}")
-            print(f"Pushing stashes for: {proj_name}")
-            print(f"{'='*60}")
+            print(f"\n{self._c('bold', '='*60)}")
+            print(f" {proj_name}")
+            print(f"{self._c('bold', '='*60)}")
             self.project_path = proj_info['path']
             try:
                 self.push_all(message=message, force=force)
                 success += 1
             except SystemExit:
-                print(f"Failed to push stashes for {proj_name}")
+                print(f"  {self._c('red', '[err]')} Push failed for {proj_name}")
                 failed += 1
             except Exception as e:
-                print(f"Error pushing {proj_name}: {e}")
+                print(f"  {self._c('red', '[err]')} {proj_name}: {e}")
                 failed += 1
 
-        print(f"\n--- Global push summary ---")
-        print(f"  Success: {success}, Failed: {failed}")
+        print(f"\n{self._c('green', 'Done:')} {success} pushed, {failed} failed")
 
     def push(self, message=None, stash_ref='stash@{0}', force=False, pick=False):
         """Push a stash patch to the SMB share."""
@@ -972,11 +983,11 @@ class SendStash:
         if pick:
             entries = self._list_stash_refs()
             if not entries:
-                print("No stashes found.")
+                print(f"{self._c('blue', '[info]')} No stashes found")
                 return
             print("Available stashes:")
             for i, (ref, msg) in enumerate(entries, 1):
-                print(f"  {i}. {ref}: {msg}")
+                print(self._format_stash_item(i, ref, msg))
             try:
                 choice = int(input("\nSelect stash number: "))
                 if choice < 1 or choice > len(entries):
@@ -1001,8 +1012,8 @@ class SendStash:
             if stash_hash_check:
                 remote_hashes = self._get_remote_hashes()
                 if stash_hash_check in remote_hashes:
-                    print(f"Skipping: stash hash {stash_hash_check} already exists on remote.")
-                    print("Use --force to push anyway.")
+                    print(f"{self._c('gray', '[skip]')} Hash {stash_hash_check} already on remote")
+                    print(f"     -> Use --force to push anyway")
                     return
 
         # Generate the patch from stash (include untracked files if present)
@@ -1017,13 +1028,13 @@ class SendStash:
                 cwd=self._get_cwd(), capture=True
             )
         if result.returncode != 0:
-            print(f"Error: Could not generate patch from {stash_ref}")
+            print(f"{self._c('red', '[err]')} Could not generate patch from {stash_ref}")
             print(result.stderr)
             return
 
         patch_content = result.stdout
         if not patch_content.strip():
-            print(f"Warning: Empty patch from {stash_ref}, skipping.")
+            print(f"{self._c('yellow', '[warn]')} Empty patch from {stash_ref}, skipping")
             return
 
         # Get stash name from git for the filename
@@ -1063,9 +1074,9 @@ class SendStash:
 
         try:
             self._upload_patch(repo_name, temp_patch_path, temp_msg_path, filename, msg_filename)
-            print(f"Pushed stash patch to: {remote_dir}/{repo_name}/{filename}")
+            print(f"  -> Pushed: {filename}")
             if message:
-                print(f"Message: {message}")
+                print(f"     -> Message: {message}")
         finally:
             os.unlink(temp_patch_path)
             os.unlink(temp_msg_path)
@@ -1100,6 +1111,41 @@ class SendStash:
         if stash_name:
             return stash_name
         return message
+
+    def _human_size(self, size_str):
+        """Convert byte string to human-readable size."""
+        try:
+            n = int(size_str)
+        except (ValueError, TypeError):
+            return size_str
+        if n < 1024:
+            return f"{n} B"
+        elif n < 1024 * 1024:
+            return f"{n / 1024:.1f} KB"
+        else:
+            return f"{n / (1024 * 1024):.1f} MB"
+
+    def _format_patch_item(self, index, name, size, date, messages):
+        """Format a single patch list item as two lines:
+          idx. "message"
+               filename  (size, date)
+        """
+        stash_name, msg, _content_hash = messages.get(name, ('', '', ''))
+        display = self._format_msg_display(stash_name, msg)
+        num = self._c('cyan', f"{index}.")
+        human = self._human_size(size)
+        if display:
+            line1 = f"  {num} {self._c('bold', display)}"
+        else:
+            line1 = f"  {num} {self._c('dim', '(no message)')}"
+        line2 = f"     {self._c('dim', name)}  {self._c('dim', f'({human}, {date})')}"
+        return f"{line1}\n{line2}"
+
+    def _format_stash_item(self, index, ref, msg):
+        """Format a single stash list item for push --pick."""
+        num = self._c('cyan', f"{index}.")
+        ref_fmt = self._c('dim', ref)
+        return f"  {num} {ref_fmt}: {msg}"
 
     def _fetch_messages(self, repo_name, patches):
         """Batch-download .msg files for a list of patches. Returns dict of patch_name -> (stash_name, message, content_hash)."""
@@ -1140,7 +1186,7 @@ class SendStash:
         patches = self._list_patches_raw(repo_name)
 
         if not patches:
-            print(f"No patches found for repo '{repo_name}'.")
+            print(f"{self._c('blue', '[info]')} No patches for '{repo_name}'")
             return []
 
         # Fetch messages for all patches in one smbclient call
@@ -1148,10 +1194,7 @@ class SendStash:
 
         print(f"Patches for '{repo_name}':")
         for i, (name, size, date) in enumerate(patches, 1):
-            stash_name, msg, _content_hash = messages.get(name, ('', '', ''))
-            display = self._format_msg_display(stash_name, msg)
-            msg_display = f'  "{display}"' if display else ''
-            print(f"  {i}. {name}  ({size} bytes, {date}){msg_display}")
+            print(self._format_patch_item(i, name, size, date, messages))
 
         return patches
 
@@ -1159,7 +1202,7 @@ class SendStash:
         """List patches for all configured projects."""
         configured = self.config.get('projects', {})
         if not configured:
-            print("No projects configured.")
+            print(f"{self._c('blue', '[info]')} No projects configured")
             return
 
         total_patches = 0
@@ -1182,19 +1225,16 @@ class SendStash:
 
             messages = self._fetch_messages(repo_name, patches)
 
-            print(f"\n{'='*60}")
-            print(f"{proj_name} ({len(patches)} patch(es))")
-            print(f"{'='*60}")
+            print(f"\n{self._c('bold', '='*60)}")
+            print(f" {proj_name} ({len(patches)} patch(es))")
+            print(f"{self._c('bold', '='*60)}")
             for i, (name, size, date) in enumerate(patches, 1):
-                stash_name, msg, _content_hash = messages.get(name, ('', '', ''))
-                display = self._format_msg_display(stash_name, msg)
-                msg_display = f'  "{display}"' if display else ''
-                print(f"  {i}. {name}  ({size} bytes, {date}){msg_display}")
+                print(self._format_patch_item(i, name, size, date, messages))
 
             total_patches += len(patches)
 
         if total_patches == 0:
-            print("No patches found for any configured project.")
+            print(f"{self._c('blue', '[info]')} No patches found")
         else:
             print(f"\nTotal: {total_patches} patch(es)")
 
@@ -1229,7 +1269,7 @@ class SendStash:
 
         patches = self._list_patches_raw(repo_name)
         if not patches:
-            print(f"No patches found for repo '{repo_name}'.")
+            print(f"{self._c('blue', '[info]')} No patches for '{repo_name}'")
             return
 
         # Fetch messages (needed for display and stash-restore)
@@ -1237,40 +1277,30 @@ class SendStash:
 
         if number is not None:
             if number < 1 or number > len(patches):
-                print(f"Invalid patch number: {number}. Must be between 1 and {len(patches)}.")
+                print(f"{self._c('red', '[err]')} Invalid patch number: {number} (must be 1-{len(patches)})")
                 return
             selected = patches[number - 1]
-            stash_name, msg, _content_hash = messages.get(selected[0], ('', '', ''))
-            display = self._format_msg_display(stash_name, msg)
-            msg_display = f'  "{display}"' if display else ''
-            print(f"Selected patch {number}: {selected[0]}{msg_display}")
+            print(f"{self._c('blue', '[info]')} Selected patch {number}:")
+            print(self._format_patch_item(number, selected[0], selected[1], selected[2], messages))
         elif name is not None:
             matches = [(i, p) for i, p in enumerate(patches, 1) if name.lower() in p[0].lower()]
             if not matches:
-                print(f"No patches matching '{name}'.")
+                print(f"{self._c('blue', '[info]')} No patches matching '{name}'")
                 return
             if len(matches) > 1:
                 print(f"Multiple patches match '{name}':")
-                for i, (num, (pname, size, date)) in enumerate(matches):
-                    stash_name, msg, _content_hash = messages.get(pname, ('', '', ''))
-                    display = self._format_msg_display(stash_name, msg)
-                    msg_display = f'  "{display}"' if display else ''
-                    print(f"  {num}. {pname}  ({size} bytes, {date}){msg_display}")
-                print("Please be more specific.")
+                for num, (pname, size, date) in matches:
+                    print(self._format_patch_item(num, pname, size, date, messages))
+                print(f"     -> Please be more specific")
                 return
             selected = matches[0][1]
-            stash_name, msg, _content_hash = messages.get(selected[0], ('', '', ''))
-            display = self._format_msg_display(stash_name, msg)
-            msg_display = f'  "{display}"' if display else ''
-            print(f"Selected patch: {selected[0]}{msg_display}")
+            print(f"{self._c('blue', '[info]')} Selected patch:")
+            print(self._format_patch_item(matches[0][0], selected[0], selected[1], selected[2], messages))
         elif pick:
             # Show list and let user choose
             print(f"Available patches for '{repo_name}':")
             for i, (pname, size, date) in enumerate(patches, 1):
-                stash_name, msg, _content_hash = messages.get(pname, ('', '', ''))
-                display = self._format_msg_display(stash_name, msg)
-                msg_display = f'  "{display}"' if display else ''
-                print(f"  {i}. {pname}  ({size} bytes, {date}){msg_display}")
+                print(self._format_patch_item(i, pname, size, date, messages))
 
             try:
                 choice = int(input("\nSelect patch number: "))
@@ -1296,19 +1326,19 @@ class SendStash:
                 patch_hash = hash_match.group(1)
                 local_hashes = self._get_local_stash_hashes()
                 if patch_hash in local_hashes:
-                    print(f"Skipping: patch hash {patch_hash} already exists in local stashes.")
-                    print("Use --force to pull anyway.")
+                    print(f"{self._c('gray', '[skip]')} Hash {patch_hash} already in local stashes")
+                    print(f"     -> Use --force to pull anyway")
                     return
 
             # Tier 2: content hash match (cross-platform true duplicate)
             if selected_content_hash:
                 local_content_hashes = self._get_local_content_hashes()
                 if selected_content_hash in local_content_hashes:
-                    print(f"Skipping: content hash {selected_content_hash} already exists in local stashes.")
-                    print("Use --force to pull anyway.")
+                    print(f"{self._c('gray', '[skip]')} Content match: {selected_content_hash}")
+                    print(f"     -> Use --force to pull anyway")
                     return
 
-        print(f"Downloading: {patch_name}")
+        print(f"{self._c('cyan', '[pull]')} {patch_name}")
 
         # Download patch to temp file
         with tempfile.NamedTemporaryFile(mode='w', suffix='.patch', delete=False) as f:
@@ -1324,19 +1354,19 @@ class SendStash:
                 # Apply directly to working directory
                 apply_result = self._run_command(f'git apply {temp_path}', cwd=self._get_cwd(), capture=True)
                 if apply_result.returncode != 0:
-                    print("Error applying patch:")
+                    print(f"{self._c('red', '[err]')} Patch apply failed")
                     print(apply_result.stderr)
-                    print("\nPatch saved at:", temp_path)
+                    print(f"     -> Patch saved: {temp_path}")
                     return
-                print(f"Successfully applied patch: {patch_name}")
+                print(f"  -> Applied to workdir: {patch_name}")
             else:
                 # Stash-restore mode: inject stash directly without touching working directory
                 stash_label = selected_stash_name or selected_msg
                 if not self._inject_stash_from_patch(temp_path, stash_label):
-                    print("\nPatch saved at:", temp_path)
+                    print(f"     -> Patch saved: {temp_path}")
                     return
 
-                print(f"Restored stash: {stash_label or patch_name}")
+                print(f"  -> Restored as: {stash_label or patch_name}")
                 # Show top stash entry
                 list_result = self._run_command('git stash list -1', cwd=self._get_cwd(), capture=True)
                 if list_result.returncode == 0 and list_result.stdout.strip():
@@ -1351,7 +1381,7 @@ class SendStash:
 
         patches = self._list_patches_raw(repo_name)
         if not patches:
-            print(f"No patches found for repo '{repo_name}'.")
+            print(f"{self._c('blue', '[info]')} No patches for '{repo_name}'")
             return
 
         messages = self._fetch_messages(repo_name, patches)
@@ -1372,17 +1402,19 @@ class SendStash:
                 # Tier 1: commit hash match (same machine)
                 hash_match = re.search(r'_([0-9a-f]{8})_\d{4}-\d{2}-\d{2}_', patch_name)
                 if hash_match and hash_match.group(1) in local_hashes:
-                    print(f"\n--- Skipping {patch_name} (hash {hash_match.group(1)} already in local stashes) ---")
+                    display = stash_name or msg or patch_name
+                    print(f"  {self._c('gray', '[skip]')} {display}  (hash match: {hash_match.group(1)})")
                     skipped_count += 1
                     continue
 
                 # Tier 2: content hash match (cross-platform true duplicate)
                 if patch_content_hash and patch_content_hash in local_content_hashes:
-                    print(f"\n--- Skipping {patch_name} (content hash {patch_content_hash} already in local stashes) ---")
+                    display = stash_name or msg or patch_name
+                    print(f"  {self._c('gray', '[skip]')} {display}  (content match: {patch_content_hash[:8]})")
                     skipped_count += 1
                     continue
 
-            print(f"\n--- Pulling {patch_name} ---")
+            print(f"\n  {self._c('cyan', '[pull]')} {patch_name}")
             stash_label = stash_name or msg or ''
 
             with tempfile.NamedTemporaryFile(mode='w', suffix='.patch', delete=False) as f:
@@ -1392,12 +1424,12 @@ class SendStash:
                 try:
                     self._download_patch(repo_name, patch_name, temp_path)
                 except RuntimeError:
-                    print(f"Failed to download {patch_name}")
+                    print(f"     -> FAILED to download")
                     continue
 
                 w_commit = self._inject_stash_from_patch(temp_path, stash_label)
                 if w_commit:
-                    print(f"Restored stash: {stash_label or patch_name}")
+                    print(f"     -> Restored as: {stash_label or patch_name}")
                     success_count += 1
 
                     # Attach source content hash as git note for cross-platform dedup
@@ -1408,21 +1440,18 @@ class SendStash:
                         )
                         local_content_hashes.add(patch_content_hash)
                 else:
-                    print(f"Failed to inject stash from {patch_name}")
+                    print(f"     -> FAILED to inject stash")
             finally:
                 if os.path.exists(temp_path):
                     os.unlink(temp_path)
 
-        summary = f"\nPulled {success_count} of {total} patch(es) as stash entries"
-        if skipped_count:
-            summary += f" ({skipped_count} skipped as duplicates)"
-        print(summary)
+        print(f"\n  {self._c('green', 'Done:')} {success_count} pulled, {skipped_count} skipped, {total - success_count - skipped_count} failed  (of {total} total)")
 
     def pull_global(self, force=False):
         """Pull all patches for all configured projects."""
         configured = self.config.get('projects', {})
         if not configured:
-            print("No projects configured.")
+            print(f"{self._c('blue', '[info]')} No projects configured")
             return
 
         success = 0
@@ -1432,25 +1461,24 @@ class SendStash:
         for proj_name, proj_info in configured.items():
             proj_path = proj_info['path']
             if not os.path.isdir(proj_path):
-                print(f"\nSkipping {proj_name}: path does not exist ({proj_path})")
+                print(f"\n  {self._c('gray', '[skip]')} {proj_name}: path not found")
                 skipped += 1
                 continue
-            print(f"\n{'='*60}")
-            print(f"Pulling patches for: {proj_name}")
-            print(f"{'='*60}")
+            print(f"\n{self._c('bold', '='*60)}")
+            print(f" {proj_name}")
+            print(f"{self._c('bold', '='*60)}")
             self.project_path = proj_path
             try:
                 self.pull_all(force=force)
                 success += 1
             except SystemExit:
-                print(f"Failed to pull patches for {proj_name}")
+                print(f"  {self._c('red', '[err]')} Pull failed for {proj_name}")
                 failed += 1
             except Exception as e:
-                print(f"Error pulling {proj_name}: {e}")
+                print(f"  {self._c('red', '[err]')} {proj_name}: {e}")
                 failed += 1
 
-        print(f"\n--- Global pull summary ---")
-        print(f"  Success: {success}, Skipped: {skipped}, Failed: {failed}")
+        print(f"\n{self._c('green', 'Done:')} {success} pulled, {skipped} skipped, {failed} failed")
 
     def clean(self, all_patches=False, older_than=None, pick=False):
         """Remove old patches from the SMB share for the current repo."""
@@ -1458,7 +1486,7 @@ class SendStash:
 
         patches = self._list_patches_raw(repo_name)
         if not patches:
-            print(f"No patches found for repo '{repo_name}'.")
+            print(f"{self._c('blue', '[info]')} No patches for '{repo_name}'")
             return
 
         to_delete = []
@@ -1468,10 +1496,7 @@ class SendStash:
 
             print(f"Available patches for '{repo_name}':")
             for i, (name, size, date) in enumerate(patches, 1):
-                stash_name, msg, _content_hash = messages.get(name, ('', '', ''))
-                display = self._format_msg_display(stash_name, msg)
-                msg_display = f'  "{display}"' if display else ''
-                print(f"  {i}. {name}  ({size} bytes, {date}){msg_display}")
+                print(self._format_patch_item(i, name, size, date, messages))
 
             try:
                 raw = input("\nSelect patch numbers to delete (comma-separated, e.g. 1,3,5): ")
@@ -1502,7 +1527,7 @@ class SendStash:
                         continue
 
         if not to_delete:
-            print("No patches to clean.")
+            print(f"{self._c('blue', '[info]')} No patches to clean")
             return
 
         try:
@@ -1510,7 +1535,7 @@ class SendStash:
         except RuntimeError:
             return
 
-        print(f"Cleaned {len(to_delete)} patch(es) from '{repo_name}':")
+        print(f"  {self._c('green', 'Done:')} {len(to_delete)} cleaned from '{repo_name}'")
         for name in to_delete:
             print(f"  - {name}")
 
@@ -1518,7 +1543,7 @@ class SendStash:
         """Clean patches for all configured projects."""
         configured = self.config.get('projects', {})
         if not configured:
-            print("No projects configured.")
+            print(f"{self._c('blue', '[info]')} No projects configured")
             return
 
         success = 0
@@ -1529,7 +1554,7 @@ class SendStash:
         for proj_name, proj_info in configured.items():
             proj_path = proj_info['path']
             if not os.path.isdir(proj_path):
-                print(f"\nSkipping {proj_name}: path does not exist ({proj_path})")
+                print(f"  {self._c('gray', '[skip]')} {proj_name}: path not found")
                 skipped += 1
                 continue
 
@@ -1538,13 +1563,13 @@ class SendStash:
             try:
                 repo_name = self._get_repo_name()
             except SystemExit:
-                print(f"Skipping {proj_name}: not a git repository")
+                print(f"  {self._c('gray', '[skip]')} {proj_name}: not a git repo")
                 skipped += 1
                 continue
 
             patches = self._list_patches_raw(repo_name)
             if not patches:
-                print(f"\n{proj_name}: no patches on remote")
+                print(f"  {self._c('gray', '[skip]')} {proj_name}: no patches")
                 skipped += 1
                 continue
 
@@ -1564,13 +1589,13 @@ class SendStash:
                 to_delete = [p[0] for p in patches]
 
             if not to_delete:
-                print(f"\n{proj_name}: no patches to clean")
+                print(f"  {self._c('gray', '[skip]')} {proj_name}: nothing to clean")
                 skipped += 1
                 continue
 
-            print(f"\n{'='*60}")
-            print(f"Cleaning {len(to_delete)} patch(es) from: {proj_name}")
-            print(f"{'='*60}")
+            print(f"\n{self._c('bold', '='*60)}")
+            print(f" {proj_name}")
+            print(f"{self._c('bold', '='*60)}")
 
             try:
                 self._delete_patches(repo_name, to_delete)
@@ -1579,15 +1604,22 @@ class SendStash:
                 total_cleaned += len(to_delete)
                 success += 1
             except SystemExit:
-                print(f"Failed to clean patches for {proj_name}")
+                print(f"  {self._c('red', '[err]')} Clean failed for {proj_name}")
                 failed += 1
             except Exception as e:
-                print(f"Error cleaning {proj_name}: {e}")
+                print(f"  {self._c('red', '[err]')} {proj_name}: {e}")
                 failed += 1
 
-        print(f"\n--- Global clean summary ---")
-        print(f"  Cleaned: {total_cleaned} patch(es) across {success} project(s)")
-        print(f"  Skipped: {skipped}, Failed: {failed}")
+        print(f"\n{self._c('green', 'Done:')} {total_cleaned} cleaned across {success} project(s), {skipped} skipped, {failed} failed")
+
+
+def _color(color, text):
+    """Colorize text if stdout is a TTY."""
+    codes = {'reset': '\033[0m', 'bold': '\033[1m', 'red': '\033[31m', 'green': '\033[32m',
+             'yellow': '\033[33m', 'blue': '\033[34m', 'cyan': '\033[36m', 'gray': '\033[90m'}
+    if sys.stdout.isatty() and color in codes:
+        return f"{codes[color]}{text}{codes['reset']}"
+    return str(text)
 
 
 def check_for_updates(tool_name):
@@ -1601,7 +1633,7 @@ def check_for_updates(tool_name):
             cwd=script_dir, capture_output=True, text=True
         )
         if result.returncode != 0:
-            print(f"{tool_name} is not installed as a git repository. Cannot check for updates.")
+            print(f"{_color('yellow', '[warn]')} Not a git repo, can't check for updates")
             return
 
         # Get current branch
@@ -1619,13 +1651,13 @@ def check_for_updates(tool_name):
         local_hash = result.stdout.strip()
 
         # Fetch latest from remote
-        print(f"Checking for {tool_name} updates...")
+        print(f"{_color('blue', '[info]')} Checking for updates...")
         result = subprocess.run(
             ['git', 'fetch'],
             cwd=script_dir, capture_output=True, text=True
         )
         if result.returncode != 0:
-            print(f"Failed to fetch updates: {result.stderr.strip()}")
+            print(f"{_color('red', '[err]')} Fetch failed: {result.stderr.strip()}")
             return
 
         # Get remote commit
@@ -1634,12 +1666,12 @@ def check_for_updates(tool_name):
             cwd=script_dir, capture_output=True, text=True
         )
         if result.returncode != 0:
-            print(f"Could not find remote branch 'origin/{branch}'.")
+            print(f"{_color('yellow', '[warn]')} Remote branch 'origin/{branch}' not found")
             return
         remote_hash = result.stdout.strip()
 
         if local_hash == remote_hash:
-            print(f"{tool_name} is up to date. ({local_hash[:7]})")
+            print(f"{_color('blue', '[info]')} Up to date ({local_hash[:7]})")
             return
 
         # Show commits behind
@@ -1650,7 +1682,7 @@ def check_for_updates(tool_name):
         commits = result.stdout.strip()
         commit_count = len(commits.splitlines())
 
-        print(f"\n{tool_name} is {commit_count} commit(s) behind origin/{branch}:\n")
+        print(f"{_color('blue', '[info]')} {commit_count} commit(s) behind origin/{branch}:")
         print(commits)
         print()
 
@@ -1667,14 +1699,14 @@ def check_for_updates(tool_name):
                 cwd=script_dir, text=True
             )
             if result.returncode == 0:
-                print(f"\n{tool_name} updated successfully!")
+                print(f"{_color('green', '[info]')} Updated successfully!")
             else:
-                print(f"\nUpdate failed. You can manually update by running 'git pull' in {script_dir}")
+                print(f"{_color('red', '[err]')} Update failed. Run 'git pull' in {script_dir}")
         else:
-            print(f"Skipped. You can update later by running 'git pull' in {script_dir}")
+            print(f"{_color('blue', '[info]')} Skipped. Run 'git pull' in {script_dir} to update later")
 
     except FileNotFoundError:
-        print("git is not installed or not in PATH. Cannot check for updates.")
+        print(f"{_color('red', '[err]')} git not found in PATH")
 
 
 def main():
