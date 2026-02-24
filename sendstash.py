@@ -563,6 +563,7 @@ class SendStash:
         try:
             workdir_env = dict(tmp_env)
             workdir_env['GIT_WORK_TREE'] = tmpdir
+            workdir_env['GIT_DIR'] = os.path.join(cwd, '.git')
 
             # Checkout HEAD's tree into temp workdir
             r = self._run_command('git checkout-index -a', cwd=cwd, capture=True, env=workdir_env)
@@ -575,13 +576,16 @@ class SendStash:
                 cwd=tmpdir, capture=True, env=workdir_env
             )
             if r.returncode != 0:
-                # Try with --3way
+                # Try with --3way for diverged bases (may exit 1 with conflicts, but files are still applied)
                 r = self._run_command(
                     f'git apply --3way --ignore-whitespace {patch_path}',
                     cwd=tmpdir, capture=True, env=workdir_env
                 )
-            if r.returncode != 0:
-                return r
+                if r.returncode != 0:
+                    # --3way exits 1 on conflicts but still applies the files — check if any files were modified
+                    applied = any('Applied patch' in line for line in (r.stderr or '').splitlines() + (r.stdout or '').splitlines())
+                    if not applied:
+                        return r
 
             # Stage all changes (including new files) into the temp index
             r = self._run_command('git add -A', cwd=tmpdir, capture=True, env=workdir_env)
@@ -692,7 +696,7 @@ class SendStash:
             print(store_result.stderr)
             return False
 
-        return True
+        return w_commit
 
     def _get_local_stash_hashes(self):
         """Get the set of stash hashes for all local stash entries."""
@@ -711,10 +715,44 @@ class SendStash:
         return hashlib.sha256(normalized.encode('utf-8', errors='replace')).hexdigest()[:16]
 
     def _get_local_content_hashes(self):
-        """Get a set of content hashes for all local stash entries."""
+        """Get a set of content hashes for all local stash entries.
+
+        Includes both:
+        - Hashes computed from local `git stash show -p` output
+        - Source content hashes stored as git notes (refs/notes/sendstash)
+          (these are added during pull to survive cross-platform hash differences)
+        """
         entries = self._list_stash_refs()
         hashes = set()
+
+        # Collect W commit SHAs for current stash entries
+        stash_commits = set()
         for ref, _ in entries:
+            rev = self._run_command(
+                f'git rev-parse {ref}',
+                cwd=self._get_cwd(), capture=True
+            )
+            if rev.returncode == 0:
+                stash_commits.add(rev.stdout.strip())
+
+        # Read source content hashes from git notes (refs/notes/sendstash),
+        # but only for commits that are still current stash entries
+        result = self._run_command(
+            'git notes --ref=sendstash list',
+            cwd=self._get_cwd(), capture=True
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            for line in result.stdout.strip().split('\n'):
+                parts = line.split()
+                if len(parts) == 2 and parts[1] in stash_commits:
+                    note_hash = self._run_command(
+                        f'git notes --ref=sendstash show {parts[1]}',
+                        cwd=self._get_cwd(), capture=True
+                    )
+                    if note_hash.returncode == 0:
+                        hashes.add(note_hash.stdout.strip())
+
+        for ref, msg in entries:
             result = self._run_command(
                 f'git stash show -p --include-untracked "{ref}"',
                 cwd=self._get_cwd(), capture=True
@@ -1239,9 +1277,18 @@ class SendStash:
                     print(f"Failed to download {patch_name}")
                     continue
 
-                if self._inject_stash_from_patch(temp_path, stash_label):
+                w_commit = self._inject_stash_from_patch(temp_path, stash_label)
+                if w_commit:
                     print(f"Restored stash: {stash_label or patch_name}")
                     success_count += 1
+
+                    # Attach source content hash as git note for cross-platform dedup
+                    if patch_content_hash:
+                        self._run_command(
+                            f'git notes --ref=sendstash add -m "{patch_content_hash}" {w_commit}',
+                            cwd=self._get_cwd(), capture=True
+                        )
+                        local_content_hashes.add(patch_content_hash)
                 else:
                     print(f"Failed to inject stash from {patch_name}")
             finally:
