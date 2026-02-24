@@ -546,6 +546,52 @@ class SendStash:
             return ''
         return result.stdout.strip()
 
+    def _apply_patch_in_temp_workdir(self, patch_path, cwd, tmp_env):
+        """Fallback: apply a patch using a temporary working directory.
+
+        When git apply --cached fails (e.g. new files not in index, or context
+        mismatch from a diverged base), checkout HEAD's tree into a temp dir,
+        apply the patch there, then git add -A to update the temp index.
+
+        Returns a result-like object with returncode 0 on success, or None on failure.
+        """
+        tmpdir = tempfile.mkdtemp(prefix='sendstash_workdir_')
+        try:
+            workdir_env = dict(tmp_env)
+            workdir_env['GIT_WORK_TREE'] = tmpdir
+
+            # Checkout HEAD's tree into temp workdir
+            r = self._run_command('git checkout-index -a', cwd=cwd, capture=True, env=workdir_env)
+            if r.returncode != 0:
+                print("Warning: checkout-index failed, temp workdir may be incomplete")
+
+            # Apply patch in the temp working directory (non-cached)
+            r = self._run_command(
+                f'git apply --ignore-whitespace {patch_path}',
+                cwd=tmpdir, capture=True, env=workdir_env
+            )
+            if r.returncode != 0:
+                # Try with --3way
+                r = self._run_command(
+                    f'git apply --3way --ignore-whitespace {patch_path}',
+                    cwd=tmpdir, capture=True, env=workdir_env
+                )
+            if r.returncode != 0:
+                return r
+
+            # Stage all changes (including new files) into the temp index
+            r = self._run_command('git add -A', cwd=tmpdir, capture=True, env=workdir_env)
+            if r.returncode != 0:
+                return r
+
+            # Return success-like object
+            class _Success:
+                returncode = 0
+                stderr = ''
+            return _Success()
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
     def _inject_stash_from_patch(self, patch_path, stash_msg):
         """Inject a stash entry directly from a patch file without touching the working directory."""
         cwd = self._get_cwd()
@@ -595,11 +641,18 @@ class SendStash:
                 print(r.stderr)
                 return False
 
-            # Apply patch to temp index
-            r = self._run_command(f'git apply --cached {patch_path}', cwd=cwd, capture=True, env=tmp_env)
+            # Apply patch to temp index (try --3way for diverged bases, --ignore-whitespace for CRLF)
+            r = self._run_command(f'git apply --cached --3way --ignore-whitespace {patch_path}', cwd=cwd, capture=True, env=tmp_env)
             if r.returncode != 0:
+                # Fallback: try without --3way in case patch lacks blob info
+                r = self._run_command(f'git apply --cached --ignore-whitespace {patch_path}', cwd=cwd, capture=True, env=tmp_env)
+            if r.returncode != 0:
+                # Final fallback: apply in a temp working directory (handles new files, diverged content)
+                r = self._apply_patch_in_temp_workdir(patch_path, cwd, tmp_env)
+            if r is None or (hasattr(r, 'returncode') and r.returncode != 0):
                 print("Error applying patch to index:")
-                print(r.stderr)
+                if hasattr(r, 'stderr') and r.stderr:
+                    print(r.stderr)
                 return False
 
             # Write tree from temp index
@@ -645,6 +698,30 @@ class SendStash:
             h = self._get_stash_hash(ref)
             if h:
                 hashes.add(h)
+        return hashes
+
+    def _content_hash(self, patch_content):
+        """SHA-256 of patch content with normalized line endings."""
+        import hashlib
+        normalized = patch_content.replace('\r\n', '\n').replace('\r', '\n')
+        return hashlib.sha256(normalized.encode('utf-8', errors='replace')).hexdigest()[:16]
+
+    def _get_local_content_hashes(self):
+        """Get a set of content hashes for all local stash entries."""
+        entries = self._list_stash_refs()
+        hashes = set()
+        for ref, _ in entries:
+            result = self._run_command(
+                f'git stash show -p --include-untracked "{ref}"',
+                cwd=self._get_cwd(), capture=True
+            )
+            if result.returncode != 0:
+                result = self._run_command(
+                    f'git stash show -p "{ref}"',
+                    cwd=self._get_cwd(), capture=True
+                )
+            if result.returncode == 0 and result.stdout.strip():
+                hashes.add(self._content_hash(result.stdout))
         return hashes
 
     def _get_remote_hashes(self):
@@ -818,9 +895,10 @@ class SendStash:
             f.write(patch_content)
             temp_patch_path = f.name
 
-        # Write message to temp file (with stash_name header)
+        # Write message to temp file (with stash_name and content_hash headers)
+        content_hash = self._content_hash(patch_content)
         with tempfile.NamedTemporaryFile(mode='w', suffix='.msg', delete=False) as f:
-            f.write(f"stash_name: {stash_name}\n---\n{message}")
+            f.write(f"stash_name: {stash_name}\ncontent_hash: {content_hash}\n---\n{message}")
             temp_msg_path = f.name
 
         try:
@@ -833,24 +911,27 @@ class SendStash:
             os.unlink(temp_msg_path)
 
     def _parse_msg_file(self, content):
-        """Parse .msg file content. Returns (stash_name, message).
+        """Parse .msg file content. Returns (stash_name, message, content_hash).
 
         New format:
             stash_name: WIP on login feature
+            content_hash: abc123...
             ---
             User's custom message here
 
-        Old format (backward compat): entire content is the message, stash_name is empty.
+        Old format (backward compat): entire content is the message, stash_name and content_hash are empty.
         """
         if '---' in content:
             header, _, body = content.partition('---')
             stash_name = ''
+            content_hash = ''
             for line in header.strip().split('\n'):
                 if line.startswith('stash_name:'):
                     stash_name = line[len('stash_name:'):].strip()
-                    break
-            return (stash_name, body.strip())
-        return ('', content.strip())
+                elif line.startswith('content_hash:'):
+                    content_hash = line[len('content_hash:'):].strip()
+            return (stash_name, body.strip(), content_hash)
+        return ('', content.strip(), '')
 
     def _format_msg_display(self, stash_name, message):
         """Format stash_name and message for display."""
@@ -861,7 +942,7 @@ class SendStash:
         return message
 
     def _fetch_messages(self, repo_name, patches):
-        """Batch-download .msg files for a list of patches. Returns dict of patch_name -> (stash_name, message)."""
+        """Batch-download .msg files for a list of patches. Returns dict of patch_name -> (stash_name, message, content_hash)."""
         backend, _ = self._detect_backend()
         messages = {}
 
@@ -907,7 +988,7 @@ class SendStash:
 
         print(f"Patches for '{repo_name}':")
         for i, (name, size, date) in enumerate(patches, 1):
-            stash_name, msg = messages.get(name, ('', ''))
+            stash_name, msg, _content_hash = messages.get(name, ('', '', ''))
             display = self._format_msg_display(stash_name, msg)
             msg_display = f'  "{display}"' if display else ''
             print(f"  {i}. {name}  ({size} bytes, {date}){msg_display}")
@@ -945,7 +1026,7 @@ class SendStash:
             print(f"{proj_name} ({len(patches)} patch(es))")
             print(f"{'='*60}")
             for i, (name, size, date) in enumerate(patches, 1):
-                stash_name, msg = messages.get(name, ('', ''))
+                stash_name, msg, _content_hash = messages.get(name, ('', '', ''))
                 display = self._format_msg_display(stash_name, msg)
                 msg_display = f'  "{display}"' if display else ''
                 print(f"  {i}. {name}  ({size} bytes, {date}){msg_display}")
@@ -999,7 +1080,7 @@ class SendStash:
                 print(f"Invalid patch number: {number}. Must be between 1 and {len(patches)}.")
                 return
             selected = patches[number - 1]
-            stash_name, msg = messages.get(selected[0], ('', ''))
+            stash_name, msg, _content_hash = messages.get(selected[0], ('', '', ''))
             display = self._format_msg_display(stash_name, msg)
             msg_display = f'  "{display}"' if display else ''
             print(f"Selected patch {number}: {selected[0]}{msg_display}")
@@ -1011,14 +1092,14 @@ class SendStash:
             if len(matches) > 1:
                 print(f"Multiple patches match '{name}':")
                 for i, (num, (pname, size, date)) in enumerate(matches):
-                    stash_name, msg = messages.get(pname, ('', ''))
+                    stash_name, msg, _content_hash = messages.get(pname, ('', '', ''))
                     display = self._format_msg_display(stash_name, msg)
                     msg_display = f'  "{display}"' if display else ''
                     print(f"  {num}. {pname}  ({size} bytes, {date}){msg_display}")
                 print("Please be more specific.")
                 return
             selected = matches[0][1]
-            stash_name, msg = messages.get(selected[0], ('', ''))
+            stash_name, msg, _content_hash = messages.get(selected[0], ('', '', ''))
             display = self._format_msg_display(stash_name, msg)
             msg_display = f'  "{display}"' if display else ''
             print(f"Selected patch: {selected[0]}{msg_display}")
@@ -1026,7 +1107,7 @@ class SendStash:
             # Show list and let user choose
             print(f"Available patches for '{repo_name}':")
             for i, (pname, size, date) in enumerate(patches, 1):
-                stash_name, msg = messages.get(pname, ('', ''))
+                stash_name, msg, _content_hash = messages.get(pname, ('', '', ''))
                 display = self._format_msg_display(stash_name, msg)
                 msg_display = f'  "{display}"' if display else ''
                 print(f"  {i}. {pname}  ({size} bytes, {date}){msg_display}")
@@ -1045,16 +1126,25 @@ class SendStash:
             selected = patches[-1]
 
         patch_name = selected[0]
-        selected_stash_name, selected_msg = messages.get(patch_name, ('', ''))
+        selected_stash_name, selected_msg, selected_content_hash = messages.get(patch_name, ('', '', ''))
 
-        # Check for duplicate hash unless --force
+        # Check for duplicate unless --force
         if not force:
+            # Tier 1: commit hash match (same machine)
             hash_match = re.search(r'_([0-9a-f]{8})_\d{4}-\d{2}-\d{2}_', patch_name)
             if hash_match:
                 patch_hash = hash_match.group(1)
                 local_hashes = self._get_local_stash_hashes()
                 if patch_hash in local_hashes:
                     print(f"Skipping: patch hash {patch_hash} already exists in local stashes.")
+                    print("Use --force to pull anyway.")
+                    return
+
+            # Tier 2: content hash match (cross-platform true duplicate)
+            if selected_content_hash:
+                local_content_hashes = self._get_local_content_hashes()
+                if selected_content_hash in local_content_hashes:
+                    print(f"Skipping: content hash {selected_content_hash} already exists in local stashes.")
                     print("Use --force to pull anyway.")
                     return
 
@@ -1106,25 +1196,33 @@ class SendStash:
 
         messages = self._fetch_messages(repo_name, patches)
 
-        # Get local hashes once for duplicate detection
+        # Get local hashes and content hashes once for duplicate detection
         local_hashes = self._get_local_stash_hashes() if not force else set()
+        local_content_hashes = self._get_local_content_hashes() if not force else set()
 
         success_count = 0
         skipped_count = 0
         total = len(patches)
 
         for patch_name, size, date in patches:
-            # Check for duplicate hash unless --force
+            stash_name, msg, patch_content_hash = messages.get(patch_name, ('', '', ''))
+
+            # Check for duplicate unless --force
             if not force:
+                # Tier 1: commit hash match (same machine)
                 hash_match = re.search(r'_([0-9a-f]{8})_\d{4}-\d{2}-\d{2}_', patch_name)
                 if hash_match and hash_match.group(1) in local_hashes:
                     print(f"\n--- Skipping {patch_name} (hash {hash_match.group(1)} already in local stashes) ---")
                     skipped_count += 1
                     continue
 
-            print(f"\n--- Pulling {patch_name} ---")
+                # Tier 2: content hash match (cross-platform true duplicate)
+                if patch_content_hash and patch_content_hash in local_content_hashes:
+                    print(f"\n--- Skipping {patch_name} (content hash {patch_content_hash} already in local stashes) ---")
+                    skipped_count += 1
+                    continue
 
-            stash_name, msg = messages.get(patch_name, ('', ''))
+            print(f"\n--- Pulling {patch_name} ---")
             stash_label = stash_name or msg or ''
 
             with tempfile.NamedTemporaryFile(mode='w', suffix='.patch', delete=False) as f:
@@ -1201,7 +1299,7 @@ class SendStash:
 
             print(f"Available patches for '{repo_name}':")
             for i, (name, size, date) in enumerate(patches, 1):
-                stash_name, msg = messages.get(name, ('', ''))
+                stash_name, msg, _content_hash = messages.get(name, ('', '', ''))
                 display = self._format_msg_display(stash_name, msg)
                 msg_display = f'  "{display}"' if display else ''
                 print(f"  {i}. {name}  ({size} bytes, {date}){msg_display}")
