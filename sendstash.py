@@ -557,7 +557,7 @@ class SendStash:
             return False
         head = head_result.stdout.strip()
 
-        head_tree_result = self._run_command('git rev-parse HEAD^{tree}', cwd=cwd, capture=True)
+        head_tree_result = self._run_command('git rev-parse HEAD:', cwd=cwd, capture=True)
         if head_tree_result.returncode != 0:
             print("Error: Could not resolve HEAD tree.")
             return False
