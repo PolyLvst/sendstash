@@ -1421,13 +1421,106 @@ class SendStash:
         print(f"  Skipped: {skipped}, Failed: {failed}")
 
 
+def check_for_updates(tool_name):
+    """Checks if there are updates available on the remote git repository."""
+    script_dir = os.path.dirname(os.path.realpath(__file__))
+
+    try:
+        # Check if it's a git repo
+        result = subprocess.run(
+            ['git', 'rev-parse', '--git-dir'],
+            cwd=script_dir, capture_output=True, text=True
+        )
+        if result.returncode != 0:
+            print(f"{tool_name} is not installed as a git repository. Cannot check for updates.")
+            return
+
+        # Get current branch
+        result = subprocess.run(
+            ['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
+            cwd=script_dir, capture_output=True, text=True
+        )
+        branch = result.stdout.strip()
+
+        # Get current local commit
+        result = subprocess.run(
+            ['git', 'rev-parse', 'HEAD'],
+            cwd=script_dir, capture_output=True, text=True
+        )
+        local_hash = result.stdout.strip()
+
+        # Fetch latest from remote
+        print(f"Checking for {tool_name} updates...")
+        result = subprocess.run(
+            ['git', 'fetch'],
+            cwd=script_dir, capture_output=True, text=True
+        )
+        if result.returncode != 0:
+            print(f"Failed to fetch updates: {result.stderr.strip()}")
+            return
+
+        # Get remote commit
+        result = subprocess.run(
+            ['git', 'rev-parse', f'origin/{branch}'],
+            cwd=script_dir, capture_output=True, text=True
+        )
+        if result.returncode != 0:
+            print(f"Could not find remote branch 'origin/{branch}'.")
+            return
+        remote_hash = result.stdout.strip()
+
+        if local_hash == remote_hash:
+            print(f"{tool_name} is up to date. ({local_hash[:7]})")
+            return
+
+        # Show commits behind
+        result = subprocess.run(
+            ['git', 'log', '--oneline', f'HEAD..origin/{branch}'],
+            cwd=script_dir, capture_output=True, text=True
+        )
+        commits = result.stdout.strip()
+        commit_count = len(commits.splitlines())
+
+        print(f"\n{tool_name} is {commit_count} commit(s) behind origin/{branch}:\n")
+        print(commits)
+        print()
+
+        # Ask user if they want to update
+        try:
+            answer = input("Do you want to update now? [y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+
+        if answer in ('y', 'yes'):
+            result = subprocess.run(
+                ['git', 'pull'],
+                cwd=script_dir, text=True
+            )
+            if result.returncode == 0:
+                print(f"\n{tool_name} updated successfully!")
+            else:
+                print(f"\nUpdate failed. You can manually update by running 'git pull' in {script_dir}")
+        else:
+            print(f"Skipped. You can update later by running 'git pull' in {script_dir}")
+
+    except FileNotFoundError:
+        print("git is not installed or not in PATH. Cannot check for updates.")
+
+
 def main():
     # Pre-parse --config so we can load projects before building the full parser
     pre_parser = argparse.ArgumentParser(add_help=False)
     pre_parser.add_argument('--config')
     pre_parser.add_argument('--sync-config', action='store_true')
     pre_parser.add_argument('--open', action='store_true')
+    pre_parser.add_argument('--check-update', action='store_true')
     pre_args, _ = pre_parser.parse_known_args()
+
+    # Handle --check-update before loading config
+    if pre_args.check_update:
+        check_for_updates("SendStash")
+        return
 
     stash = SendStash(config_path=pre_args.config)
 
@@ -1446,6 +1539,7 @@ def main():
     parser.add_argument('--config', help="Path to config.yaml")
     parser.add_argument('--sync-config', action='store_true', help="Sync the configuration from its source before running the command")
     parser.add_argument('--open', action='store_true', help="Open the SendStash directory in file explorer")
+    parser.add_argument('--check-update', action='store_true', help="Check if a newer version is available on the remote git repository.")
 
     subparsers = parser.add_subparsers(dest='command', help="Available commands")
 
