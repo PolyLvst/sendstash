@@ -550,6 +550,91 @@ class SendStash:
             return ''
         return result.stdout.strip()
 
+    def _generate_rej_for_skipped(self, patch_path, skipped_files, workdir):
+        """Generate .rej files for files that git apply --reject skipped entirely.
+
+        When git apply reports "does not exist in index" or "does not match index",
+        it doesn't generate .rej files. This extracts the diff hunks for those files
+        from the patch and writes them as .rej files so users can inspect them.
+        """
+        with open(patch_path, 'r', errors='replace') as f:
+            lines = f.readlines()
+
+        i = 0
+        while i < len(lines):
+            if lines[i].startswith('diff --git a/'):
+                # Extract the b/ path
+                parts = lines[i].split(' b/')
+                if len(parts) >= 2:
+                    file_path = parts[-1].strip()
+                else:
+                    i += 1
+                    continue
+
+                if file_path in skipped_files:
+                    # Collect all lines for this diff section
+                    diff_lines = [lines[i]]
+                    j = i + 1
+                    while j < len(lines) and not lines[j].startswith('diff --git '):
+                        diff_lines.append(lines[j])
+                        j += 1
+
+                    # Write .rej file
+                    rej_path = os.path.join(workdir, file_path + '.rej')
+                    rej_dir = os.path.dirname(rej_path)
+                    if rej_dir and not os.path.isdir(rej_dir):
+                        os.makedirs(rej_dir, exist_ok=True)
+                    with open(rej_path, 'w', newline='') as rej:
+                        rej.writelines(diff_lines)
+
+                    i = j
+                    continue
+            i += 1
+
+    def _prepare_patch_targets(self, patch_path, workdir):
+        """Ensure files referenced in a patch exist in workdir with correct base content.
+
+        For files that don't exist in the workdir (not in HEAD's tree), reconstructs
+        the original (pre-patch) content from the diff's context and removal lines,
+        so that patch(1) can apply hunks against the correct base.
+        """
+        # Parse the patch into per-file sections
+        with open(patch_path, 'r', errors='replace') as f:
+            lines = f.readlines()
+
+        i = 0
+        while i < len(lines):
+            # Find +++ b/path header
+            if lines[i].startswith('+++ b/'):
+                rel_path = lines[i][6:].strip()
+                if rel_path == '/dev/null':
+                    i += 1
+                    continue
+                full_path = os.path.join(workdir, rel_path)
+                parent = os.path.dirname(full_path)
+                if parent and not os.path.isdir(parent):
+                    os.makedirs(parent, exist_ok=True)
+
+                if not os.path.exists(full_path):
+                    # Reconstruct original file content from diff hunks
+                    # Context lines (space prefix) and removal lines (- prefix) = original
+                    original_lines = []
+                    j = i + 1
+                    while j < len(lines):
+                        line = lines[j]
+                        if line.startswith('diff --git '):
+                            break
+                        if line.startswith('@@'):
+                            j += 1
+                            continue
+                        if line.startswith(' ') or line.startswith('-'):
+                            original_lines.append(line[1:])
+                        # '+' lines are additions — skip for original content
+                        j += 1
+                    with open(full_path, 'w', newline='') as out:
+                        out.writelines(original_lines)
+            i += 1
+
     def _apply_patch_in_temp_workdir(self, patch_path, cwd, tmp_env):
         """Fallback: apply a patch using a temporary working directory.
 
@@ -585,7 +670,40 @@ class SendStash:
                     # --3way exits 1 on conflicts but still applies the files — check if any files were modified
                     applied = any('Applied patch' in line for line in (r.stderr or '').splitlines() + (r.stdout or '').splitlines())
                     if not applied:
-                        return r
+                        # Fallback: git apply --reject (cross-platform, applies what it can)
+                        self._prepare_patch_targets(patch_path, tmpdir)
+                        # Stage prepared files so git apply --reject can see them in the index
+                        self._run_command('git add -A', cwd=tmpdir, capture=True, env=workdir_env)
+                        r2 = self._run_command(
+                            f'git apply --reject --ignore-whitespace {patch_path}',
+                            cwd=tmpdir, capture=True, env=workdir_env
+                        )
+
+                        # Generate .rej for files that git apply skipped entirely
+                        # (e.g. "does not exist in index" or "does not match index")
+                        skipped_files = set()
+                        for line in (r2.stderr or '').splitlines():
+                            if ': does not exist in index' in line or ': does not match index' in line:
+                                fname = line.split('error: ', 1)[-1].split(':')[0].strip()
+                                skipped_files.add(fname)
+                        if skipped_files:
+                            self._generate_rej_for_skipped(patch_path, skipped_files, tmpdir)
+
+                        # Collect .rej files
+                        rej_files = []
+                        for root, dirs, files in os.walk(tmpdir):
+                            for f in files:
+                                if f.endswith('.rej'):
+                                    rej_files.append(os.path.relpath(os.path.join(root, f), tmpdir))
+
+                        # Check if anything was applied or .rej files were generated
+                        applied_reject = 'Applied patch' in (r2.stderr or '') + (r2.stdout or '')
+                        if not applied_reject and not rej_files and r2.returncode != 0:
+                            return r  # nothing applied at all
+
+                        if rej_files:
+                            print("Warning: patch was created against a different base.")
+                            print(f"  .rej files included in stash: {', '.join(rej_files)}")
 
             # Stage all changes (including new files) into the temp index
             r = self._run_command('git add -A', cwd=tmpdir, capture=True, env=workdir_env)
