@@ -228,6 +228,40 @@ class SendStash:
 
         return results
 
+    def scan(self, path=None):
+        """Recursively scan directories for git repos with stashes."""
+        if path:
+            scan_root = os.path.expanduser(path)
+        else:
+            scan_root = os.path.expanduser(self.config.get('root', ''))
+
+        if not os.path.isdir(scan_root):
+            print(f"{self._c('red', '[error]')} Directory not found: {scan_root}")
+            return
+
+        print(f"{self._c('blue', '[scan]')} Scanning {scan_root} for repos with stashes...")
+
+        results = []
+        for dirpath, dirnames, _ in os.walk(scan_root):
+            if '.git' in dirnames:
+                result = self._run_command('git stash list', cwd=dirpath, capture=True)
+                if result.returncode == 0 and result.stdout.strip():
+                    stash_count = len(result.stdout.strip().split('\n'))
+                    name = os.path.basename(dirpath)
+                    results.append((name, dirpath, stash_count))
+                # Don't descend into .git
+                dirnames.remove('.git')
+
+        if not results:
+            print(f"{self._c('yellow', '[info]')} No repos with stashes found.")
+            return
+
+        print(f"\n{self._c('green', '[found]')} {len(results)} repo(s) with stashes:\n")
+        for name, repo_path, count in sorted(results, key=lambda x: x[0]):
+            print(f"  {self._c('cyan', name):30s} ({count} stash{'es' if count != 1 else ''})  {repo_path}")
+
+        self._ensure_projects_in_config(results)
+
     def _ensure_projects_in_config(self, repos):
         """Check scanned repos against config and prompt to add new ones."""
         configured = set(self.config.get('projects', {}).keys())
@@ -277,7 +311,9 @@ class SendStash:
             raw_config['projects'] = {}
 
         for name, path in to_add:
-            raw_config['projects'][name] = {'path': '{root}/projects/' + name}
+            expanded_root = os.path.expanduser(root)
+            rel_path = os.path.relpath(path, expanded_root)
+            raw_config['projects'][name] = {'path': '{root}/' + rel_path}
             print(f"  {self._c('green', '[+]')} {name}")
 
         with open(self.config_path, 'w') as f:
@@ -1792,6 +1828,10 @@ def main():
     clean_group.add_argument('--older-than', type=int, metavar='DAYS', help="Remove patches older than N days")
     clean_group.add_argument('--pick', action='store_true', help="Interactively choose patches to delete")
 
+    # scan
+    scan_parser = subparsers.add_parser('scan', help="Scan directories for git repos with stashes")
+    scan_parser.add_argument('path', nargs='?', default=None, help="Path to scan (default: root from config)")
+
     args = parser.parse_args()
 
     if not args.command:
@@ -1801,7 +1841,7 @@ def main():
     if hasattr(args, 'global_flag') and args.global_flag and args.project:
         parser.error("--global and --project cannot be used together")
 
-    if args.project:
+    if hasattr(args, 'project') and args.project:
         stash.set_project(args.project)
 
     if args.command == 'push':
@@ -1832,6 +1872,8 @@ def main():
             parser.error("clean requires one of: --all, --older-than, --pick, or --global")
         else:
             stash.clean(all_patches=args.all, older_than=args.older_than, pick=args.pick)
+    elif args.command == 'scan':
+        stash.scan(path=args.path)
 
 
 if __name__ == '__main__':
