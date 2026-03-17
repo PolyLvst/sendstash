@@ -880,6 +880,18 @@ class SendStash:
         normalized = patch_content.replace('\r\n', '\n').replace('\r', '\n')
         return hashlib.sha256(normalized.encode('utf-8', errors='replace')).hexdigest()[:16]
 
+    def _semantic_content_hash(self, patch_content):
+        """SHA-256 of patch content with index lines stripped.
+
+        Git 'index' lines contain blob hashes that change on re-stash even when
+        the actual diff is identical.  Stripping them gives a stable hash for
+        semantically identical patches.
+        """
+        import hashlib
+        normalized = patch_content.replace('\r\n', '\n').replace('\r', '\n')
+        stripped = re.sub(r'^index [0-9a-f]+\.\.[0-9a-f]+( \d+)?$', '', normalized, flags=re.MULTILINE)
+        return hashlib.sha256(stripped.encode('utf-8', errors='replace')).hexdigest()[:16]
+
     def _get_local_content_hashes(self):
         """Get a set of content hashes for all local stash entries.
 
@@ -930,6 +942,7 @@ class SendStash:
                 )
             if result.returncode == 0 and result.stdout.strip():
                 hashes.add(self._content_hash(result.stdout))
+                hashes.add(self._semantic_content_hash(result.stdout))
         return hashes
 
     def _get_remote_hashes(self):
@@ -943,6 +956,90 @@ class SendStash:
             if match:
                 hashes.add(match.group(1))
         return hashes
+
+    def _get_remote_content_hashes(self, repo_name=None):
+        """Get the set of content and semantic hashes from remote patches.
+
+        For patches whose .msg already contains a semantic_hash, that value is
+        used directly.  For older .msg files without one, the actual .patch file
+        is downloaded and the semantic hash is computed on the fly.
+        """
+        if repo_name is None:
+            repo_name = self._get_repo_name()
+        patches = self._list_patches_raw(repo_name)
+        messages = self._fetch_messages(repo_name, patches)
+        hashes = set()
+        need_download = []
+        for patch_name, _, _ in patches:
+            _, _, ch, sh = messages.get(patch_name, ('', '', '', ''))
+            if ch:
+                hashes.add(ch)
+            if sh:
+                hashes.add(sh)
+            elif ch:
+                # Old .msg without semantic_hash — need to download patch to compute it
+                need_download.append(patch_name)
+
+        # Download and compute semantic hashes for legacy patches
+        for patch_name in need_download:
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.patch', delete=False) as f:
+                temp_path = f.name
+            try:
+                self._download_patch(repo_name, patch_name, temp_path)
+                with open(temp_path, 'r') as f:
+                    content = f.read()
+                if content.strip():
+                    hashes.add(self._semantic_content_hash(content))
+            except (RuntimeError, OSError):
+                pass
+            finally:
+                if os.path.exists(temp_path):
+                    os.unlink(temp_path)
+
+        return hashes
+
+    def _check_push_duplicate(self, stash_ref, remote_hashes, remote_content_hashes):
+        """Check if a local stash already exists on the remote. Returns skip reason or None."""
+        # Tier 1: commit hash match
+        stash_hash = self._get_stash_hash(stash_ref)
+        if stash_hash and stash_hash in remote_hashes:
+            return f"hash match: {stash_hash}"
+
+        # Tier 2: content hash match
+        if remote_content_hashes:
+            result = self._run_command(
+                f'git stash show -p --include-untracked "{stash_ref}"',
+                cwd=self._get_cwd(), capture=True
+            )
+            if result.returncode != 0:
+                result = self._run_command(
+                    f'git stash show -p "{stash_ref}"',
+                    cwd=self._get_cwd(), capture=True
+                )
+            if result.returncode == 0 and result.stdout.strip():
+                ch = self._content_hash(result.stdout)
+                if ch in remote_content_hashes:
+                    return f"content match: {ch[:8]}"
+                sh = self._semantic_content_hash(result.stdout)
+                if sh in remote_content_hashes:
+                    return f"content match: {sh[:8]}"
+
+        return None
+
+    def _check_pull_duplicate(self, patch_name, content_hash, semantic_hash, local_hashes, local_content_hashes):
+        """Check if a remote patch already exists locally. Returns skip reason or None."""
+        # Tier 1: commit hash match
+        hash_match = re.search(r'_([0-9a-f]{8})_\d{4}-\d{2}-\d{2}_', patch_name)
+        if hash_match and hash_match.group(1) in local_hashes:
+            return f"hash match: {hash_match.group(1)}"
+
+        # Tier 2: content hash match (raw or semantic)
+        if content_hash and content_hash in local_content_hashes:
+            return f"content match: {content_hash[:8]}"
+        if semantic_hash and semantic_hash in local_content_hashes:
+            return f"content match: {semantic_hash[:8]}"
+
+        return None
 
     def _list_stash_refs(self):
         """Returns a list of (ref, message) for all stash entries."""
@@ -966,12 +1063,14 @@ class SendStash:
 
         # Get existing patches on SMB to avoid duplicates
         remote_hashes = self._get_remote_hashes() if not force else set()
+        remote_content_hashes = self._get_remote_content_hashes() if not force else set()
 
         for ref, _ in entries:
-            stash_hash = self._get_stash_hash(ref)
-            if stash_hash and stash_hash in remote_hashes:
-                print(f"  {self._c('gray', '[skip]')} {ref}  (already pushed: {stash_hash})")
-                continue
+            if not force:
+                skip_reason = self._check_push_duplicate(ref, remote_hashes, remote_content_hashes)
+                if skip_reason:
+                    print(f"  {self._c('gray', '[skip]')} {ref}  ({skip_reason})")
+                    continue
             print(f"\n  {self._c('cyan', '[push]')} {ref}")
             self.push(message=message, stash_ref=ref, force=True)
 
@@ -1042,15 +1141,15 @@ class SendStash:
         branch = self._get_branch_name()
         remote_dir = self._get_remote_dir()
 
-        # Check for duplicate hash on remote unless --force
+        # Check for duplicate on remote unless --force
         if not force:
-            stash_hash_check = self._get_stash_hash(stash_ref)
-            if stash_hash_check:
-                remote_hashes = self._get_remote_hashes()
-                if stash_hash_check in remote_hashes:
-                    print(f"{self._c('gray', '[skip]')} Hash {stash_hash_check} already on remote")
-                    print(f"     -> Use --force to push anyway")
-                    return
+            remote_hashes = self._get_remote_hashes()
+            remote_content_hashes = self._get_remote_content_hashes()
+            skip_reason = self._check_push_duplicate(stash_ref, remote_hashes, remote_content_hashes)
+            if skip_reason:
+                print(f"{self._c('gray', '[skip]')} Already on remote ({skip_reason})")
+                print(f"     -> Use --force to push anyway")
+                return
 
         # Generate the patch from stash (include untracked files if present)
         result = self._run_command(
@@ -1104,8 +1203,9 @@ class SendStash:
 
         # Write message to temp file (with stash_name and content_hash headers)
         content_hash = self._content_hash(patch_content)
+        semantic_hash = self._semantic_content_hash(patch_content)
         with tempfile.NamedTemporaryFile(mode='w', suffix='.msg', delete=False) as f:
-            f.write(f"stash_name: {stash_name}\ncontent_hash: {content_hash}\n---\n{message}")
+            f.write(f"stash_name: {stash_name}\ncontent_hash: {content_hash}\nsemantic_hash: {semantic_hash}\n---\n{message}")
             temp_msg_path = f.name
 
         try:
@@ -1118,11 +1218,12 @@ class SendStash:
             os.unlink(temp_msg_path)
 
     def _parse_msg_file(self, content):
-        """Parse .msg file content. Returns (stash_name, message, content_hash).
+        """Parse .msg file content. Returns (stash_name, message, content_hash, semantic_hash).
 
         New format:
             stash_name: WIP on login feature
             content_hash: abc123...
+            semantic_hash: def456...
             ---
             User's custom message here
 
@@ -1132,13 +1233,16 @@ class SendStash:
             header, _, body = content.partition('---')
             stash_name = ''
             content_hash = ''
+            semantic_hash = ''
             for line in header.strip().split('\n'):
                 if line.startswith('stash_name:'):
                     stash_name = line[len('stash_name:'):].strip()
                 elif line.startswith('content_hash:'):
                     content_hash = line[len('content_hash:'):].strip()
-            return (stash_name, body.strip(), content_hash)
-        return ('', content.strip(), '')
+                elif line.startswith('semantic_hash:'):
+                    semantic_hash = line[len('semantic_hash:'):].strip()
+            return (stash_name, body.strip(), content_hash, semantic_hash)
+        return ('', content.strip(), '', '')
 
     def _format_msg_display(self, stash_name, message):
         """Format stash_name and message for display."""
@@ -1166,7 +1270,7 @@ class SendStash:
           idx. "message"
                filename  (size, date)
         """
-        stash_name, msg, _content_hash = messages.get(name, ('', '', ''))
+        stash_name, msg, _content_hash, _semantic_hash = messages.get(name, ('', '', '', ''))
         display = self._format_msg_display(stash_name, msg)
         num = self._c('cyan', f"{index}.")
         human = self._human_size(size)
@@ -1352,27 +1456,19 @@ class SendStash:
             selected = patches[-1]
 
         patch_name = selected[0]
-        selected_stash_name, selected_msg, selected_content_hash = messages.get(patch_name, ('', '', ''))
+        selected_stash_name, selected_msg, selected_content_hash, selected_semantic_hash = messages.get(patch_name, ('', '', '', ''))
 
         # Check for duplicate unless --force
         if not force:
-            # Tier 1: commit hash match (same machine)
-            hash_match = re.search(r'_([0-9a-f]{8})_\d{4}-\d{2}-\d{2}_', patch_name)
-            if hash_match:
-                patch_hash = hash_match.group(1)
-                local_hashes = self._get_local_stash_hashes()
-                if patch_hash in local_hashes:
-                    print(f"{self._c('gray', '[skip]')} Hash {patch_hash} already in local stashes")
-                    print(f"     -> Use --force to pull anyway")
-                    return
-
-            # Tier 2: content hash match (cross-platform true duplicate)
-            if selected_content_hash:
-                local_content_hashes = self._get_local_content_hashes()
-                if selected_content_hash in local_content_hashes:
-                    print(f"{self._c('gray', '[skip]')} Content match: {selected_content_hash}")
-                    print(f"     -> Use --force to pull anyway")
-                    return
+            local_hashes = self._get_local_stash_hashes()
+            local_content_hashes = self._get_local_content_hashes()
+            skip_reason = self._check_pull_duplicate(
+                patch_name, selected_content_hash, selected_semantic_hash, local_hashes, local_content_hashes
+            )
+            if skip_reason:
+                print(f"{self._c('gray', '[skip]')} Already in local stashes ({skip_reason})")
+                print(f"     -> Use --force to pull anyway")
+                return
 
         print(f"{self._c('cyan', '[pull]')} {patch_name}")
 
@@ -1431,22 +1527,16 @@ class SendStash:
         total = len(patches)
 
         for patch_name, size, date in patches:
-            stash_name, msg, patch_content_hash = messages.get(patch_name, ('', '', ''))
+            stash_name, msg, patch_content_hash, patch_semantic_hash = messages.get(patch_name, ('', '', '', ''))
 
             # Check for duplicate unless --force
             if not force:
-                # Tier 1: commit hash match (same machine)
-                hash_match = re.search(r'_([0-9a-f]{8})_\d{4}-\d{2}-\d{2}_', patch_name)
-                if hash_match and hash_match.group(1) in local_hashes:
+                skip_reason = self._check_pull_duplicate(
+                    patch_name, patch_content_hash, patch_semantic_hash, local_hashes, local_content_hashes
+                )
+                if skip_reason:
                     display = stash_name or msg or patch_name
-                    print(f"  {self._c('gray', '[skip]')} {display}  (hash match: {hash_match.group(1)})")
-                    skipped_count += 1
-                    continue
-
-                # Tier 2: content hash match (cross-platform true duplicate)
-                if patch_content_hash and patch_content_hash in local_content_hashes:
-                    display = stash_name or msg or patch_name
-                    print(f"  {self._c('gray', '[skip]')} {display}  (content match: {patch_content_hash[:8]})")
+                    print(f"  {self._c('gray', '[skip]')} {display}  ({skip_reason})")
                     skipped_count += 1
                     continue
 
