@@ -204,7 +204,7 @@ class SendStash:
 
     def _get_cwd(self):
         """Get the working directory — project path if set, otherwise current dir."""
-        return self.project_path or None
+        return self.project_path or os.getcwd()
 
     def _scan_repos_with_stashes(self):
         """Scan {root}/projects/*/ for git repos that have stashes.
